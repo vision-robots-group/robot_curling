@@ -78,7 +78,7 @@ class MarkerDetector(Node):
             self.get_logger().error(f"CvBridge Error: {e}")
             return None
         gray_frame = self.__calibration(gray_image=gray_frame)
-        gray_frame = self.__image_filter(gray_image=gray_frame)
+        # gray_frame = self.__image_filter(gray_image=gray_frame)
         return gray_frame
 
     def __calibration(self, gray_image: np.ndarray) -> np.ndarray:
@@ -88,9 +88,42 @@ class MarkerDetector(Node):
         # TODO
         return gray_image
 
-    def __image_filter(self, gray_image: np.ndarray) -> np.ndarray:
+    def __image_filter(
+        self,
+        img: np.ndarray,
+        bg_sigma: float | None = None,
+        clip_limit: float = 2.0,
+        tile: int = 8,
+        sharpen: float = 0.5) -> np.ndarray:
         """
-        Type 2 of preprocessing: apply image filter to change colors and contrast.
+        Preprocessing to make AprilTag detection more robust.
+        - bg_sigma: Gaussian sigma used to estimate the slowly varying background illumination.
+            It should be clearly larget than a tag in pixels. Default is max(H,W) / 8
+        - clip_limit: CLAHE contrast limit. Higher means stronger local contrast.
+        - tile: CLAHE grid size, the image is split into tile x tile regions.
+        - sharpen: unsharp mask strength. 0 means no sharpening.
         """
-        # TODO
-        return gray_image
+        x = img.astype(np.float32)
+
+        # Flatten illumination: subtract a heavily blurred copy (background)
+        if bg_sigma is NOne:
+            bg_sigma = max(img.shape) / 8
+        background = cv2.GaussianBlur(x, (0,0), bg_sigma)
+        x = x - background + 128.0
+
+        # Stretch contrast using percentiles
+        lo, hi = np.percentile(x, (1,99))
+        x = np.clip((x - lo) / max(hi - lo, 1e-6), 0, 1) * 255.0
+        x = x.astype(np.uint8)
+
+        # Local contrast equalization
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
+        x = clahe.apply(x)
+
+        # Light denoise, then unsharp mask to crisp up the tag edges
+        x = cv2.GaussianBlur(x, (0,0), 0.8)
+        if sharpen > 0:
+            blurred = cv2.GaussianBlur(x, (0.0), 1.5)
+            x = cv2.addWeighted(x, 1.0 + sharpen, blurred, -sharpen, 0)
+
+        return x
