@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'marker_detector = marker_detection_pkg.marker_detector:main',
         ],
     },
 )
