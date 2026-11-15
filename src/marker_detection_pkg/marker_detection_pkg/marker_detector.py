@@ -44,7 +44,7 @@ class MarkerDetector(Node):
             detection.id = int(r.tag_id)
 
             # TODO: detect with camera information
-            detection.d = 0.0
+            detection.dist = 0.0
             detection.theta = 0.0
 
             detection_array.detections.append(detection)
@@ -78,7 +78,7 @@ class MarkerDetector(Node):
             self.get_logger().error(f"CvBridge Error: {e}")
             return None
         gray_frame = self.__calibration(gray_image=gray_frame)
-        # gray_frame = self.__image_filter(gray_image=gray_frame)
+        # gray_frame = self.__image_filter(img=gray_frame)
         return gray_frame
 
     def __calibration(self, gray_image: np.ndarray) -> np.ndarray:
@@ -106,7 +106,7 @@ class MarkerDetector(Node):
         x = img.astype(np.float32)
 
         # Flatten illumination: subtract a heavily blurred copy (background)
-        if bg_sigma is NOne:
+        if bg_sigma is None:
             bg_sigma = max(img.shape) / 8
         background = cv2.GaussianBlur(x, (0,0), bg_sigma)
         x = x - background + 128.0
@@ -123,7 +123,24 @@ class MarkerDetector(Node):
         # Light denoise, then unsharp mask to crisp up the tag edges
         x = cv2.GaussianBlur(x, (0,0), 0.8)
         if sharpen > 0:
-            blurred = cv2.GaussianBlur(x, (0.0), 1.5)
+            blurred = cv2.GaussianBlur(x, (0,0), 1.5)
             x = cv2.addWeighted(x, 1.0 + sharpen, blurred, -sharpen, 0)
 
         return x
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MarkerDetector()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
