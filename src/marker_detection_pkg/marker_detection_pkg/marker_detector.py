@@ -17,15 +17,59 @@ except ImportError:  # ARM (rover): no pupil wheels, dt_apriltags has the same A
     import dt_apriltags as pupil_apriltags
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
+from sensor_msgs.msg import CameraInfo, JointState
+from rclpy.qos import qos_profile_sensor_data
+
 DEFAULTS = {
     "calibration": True,
+    "marker_size_m": 0.30,
 }
-
 
 class MarkerDetector(Node):
     def __init__(self):
         super().__init__('marker_detector')
         self.__load_config()
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.rectification = np.eye(3)
+        self.joint_positions = {}
+
+        # Fixed geometry from Waveshare's ugv_rover.urdf.
+        # Coordinates are in metres, rotations in radians
+        self.pan_origin = np.array([-0.008741, 0.0, 0.088])
+        self.tilt_origin = np.array([0.0, 0.02, 0.043003])
+        self.camera_origin = np.array([0.047686, -0.000569, 0.02])
+
+        self.tilt_mount_rotation = cv2.Rodrigues( np.array([1.5708, 0.0, 0.0]) )[0]
+
+        self.camera_mount_rotation = (
+            cv2.Rodrigues(np.array([0.0, -1.5708, 0.0]))[0]
+            @ cv2.Rodrigues(np.array([3.14, 0.0, 0.0]))[0]
+        )
+
+        half = self.marker_size_m / 2
+        self.marker_points = np.array([
+            [-half,  half, 0.0],
+            [ half,  half, 0.0],
+            [ half, -half, 0.0],
+            [-half, -half, 0.0],
+        ], dtype=np.float64)
+
+        def update_camera_info(msg):
+            if self.calibration:
+                self.camera_matrix = np.array(msg.p).reshape(3, 4)[:, :3].copy()
+                self.dist_coeffs = np.zeros(5)
+                self.rectification = np.array(msg.r).reshape(3, 3)
+            else:
+                self.camera_matrix = np.array(msg.k).reshape(3, 3)
+                self.dist_coeffs = np.array(msg.d)
+                self.rectification = np.eye(3)
+
+        def update_joint_positions(msg):
+            self.joint_positions.update(zip(msg.name, msg.position))
+
+        self.camera_info_subscription = self.create_subscription( CameraInfo, "/camera_info", update_camera_info, qos_profile_sensor_data)
+        self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
         self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
@@ -54,6 +98,27 @@ class MarkerDetector(Node):
         """
         if self.calibration: return '/image_rect'
         else: return '/image_raw'
+        
+    def camera_to_robot(self, position_camera, pan, tilt):
+        """Convert camera optical coordinates into robot base_link coordinates."""
+        pan_rotation = cv2.Rodrigues(np.array([0.0, 0.0, -pan]) )[0]
+        tilt_rotation = cv2.Rodrigues(np.array([0.0, 0.0, tilt]))[0]
+
+        position = ( self.camera_mount_rotation @ np.asarray(position_camera).reshape(3) + self.camera_origin)
+        position = ( self.tilt_mount_rotation @ (tilt_rotation @ position) + self.tilt_origin )
+        return pan_rotation @ position + self.pan_origin
+
+
+    def calculate_marker_distance(self, position_robot):
+        """Horizontal distance from base_link to marker centre in metres."""
+        x, y, _ = position_robot
+        return float(np.hypot(x, y))
+
+
+    def calculate_marker_angle(self, position_robot):
+        """Bearing in radians: positive left, negative right."""
+        x, y, _ = position_robot
+        return float(np.arctan2(y, x))
        
     def detect(self, gray_image: np.ndarray) -> DetectionArray:
         """
@@ -62,21 +127,50 @@ class MarkerDetector(Node):
         It contains the ``apriltag`` logic.
         """
         detection_array = DetectionArray()
-        tags = [(r.tag_id, r.tag_family.decode()) for det in self.april for r in det.detect(gray_image)]
+        pan = self.joint_positions.get("pt_base_link_to_pt_link1")
+        tilt = self.joint_positions.get("pt_link1_to_pt_link2")
+
+        if self.camera_matrix is None or pan is None or tilt is None:
+            return detection_array
+
+        tags = [
+            (r.tag_id, r.tag_family.decode(), r.corners)
+            for detector in self.april
+            for r in detector.detect(gray_image)
+        ]
+
         corners, ids, _ = self.aruco.detectMarkers(gray_image)
         if ids is not None:
-            tags += [(i, "aruco4x4_50") for i in ids.flatten().tolist()]
+            tags += [
+                (int(marker_id), "aruco4x4_50", marker_corners)
+                for marker_id, marker_corners in zip(ids.flatten(), corners)
+            ]
 
-        # Fill the detection array
-        for tag_id, family in tags:
+        for tag_id, family, marker_corners in tags:
+            image_points = np.asarray( marker_corners, dtype=np.float64 ).reshape(4, 2)
+
+            # normalization of corner winding between AprilTag and ArUco.
+            following = np.roll(image_points, -1, axis=0)
+            signed_area =np.sum( image_points[:, 0]*following[:, 1] - image_points[:, 1]* following[:, 0])
+            
+            if signed_area < 0:
+                image_points = image_points[[0, 3, 2, 1]]
+
+            success, bla, tvec = cv2.solvePnP(self.marker_points, np.ascontiguousarray(image_points), 
+                                              self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            
+            if ( not success or not np.isfinite(tvec).all() or tvec[2, 0] <= 0 ):
+                continue
+
+            # undoing rectification to recover physical optical coordinates
+            position_camera = self.rectification.T @ tvec.reshape(3)
+            position_robot = self.camera_to_robot(position_camera, pan, tilt)
+
             detection = Detection()
             detection.id = int(tag_id)
             detection.family = family
-
-            # TODO: detect with camera information
-            detection.dist = 0.0
-            detection.theta = 0.0
-
+            detection.dist = self.calculate_marker_distance(position_robot)
+            detection.theta = self.calculate_marker_angle(position_robot)
             detection_array.detections.append(detection)
 
         return detection_array

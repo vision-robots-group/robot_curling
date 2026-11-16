@@ -1,3 +1,4 @@
-agent:
-  ros_parameters:
-    calibration: True
+marker_detector:
+  ros__parameters:
+    calibration: true    # true: /image_rect; false: /image_raw
+    marker_size_m: 0.30  # size in meters of detected marker square (excluding surrounding paper)
