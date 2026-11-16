@@ -1,5 +1,5 @@
 """
-This class will subscribe to the pan-tilt camera (subscribe to ``/image_raw`` and publish to ``/detected_markers``)
+This class will subscribe to the pan-tilt camera (subscribe to ``/image_rect`` and publish to ``/detected_markers``)
 
 The type will be Float32 or somethng with less bits.
 The format is the following: obj1_id, obj1_d, obj1_theta, ..., objn_id, objn_d, objn_theta.
@@ -14,13 +14,18 @@ import numpy as np
 import apriltag
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
+DEFAULTS = {
+    "calibration": True,
+}
+
 
 class MarkerDetector(Node):
     def __init__(self):
         super().__init__('marker_detector')
-
+        self.__load_config()
         # ROS2 variables
-        self.subscription_ = self.create_subscription(Image, '/image_raw', self.listener_callback, 10) # or we can use /image_raw/compressed
+        self.image_topic = self.subscribe_to_img()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
+        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
@@ -28,7 +33,25 @@ class MarkerDetector(Node):
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
         self.detector: apriltag.Detector = apriltag.Detector()
+        
 
+    def __load_config(self):
+            """
+            Load the parameters (``--params-file config.yaml``).
+            """
+            for k, default in DEFAULTS.items():
+                v = self.declare_parameter(k, default).value
+                setattr(self, k, v)
+
+    def subscribe_to_img(self) -> str:
+        """
+        Return the image topic.
+        """
+        if self.__calibration:
+            return'/image_rect'
+        else:
+            return '/image_raw'
+       
     def detect(self, gray_image: np.ndarray) -> DetectionArray:
         """
         Main function that detects the markers and returns the array.
@@ -54,7 +77,7 @@ class MarkerDetector(Node):
 
     def listener_callback(self, msg: Image) -> DetectionArray:
         """
-        ``/camera_raw`` subscriber callback.
+        ``/image_rect`` subscriber callback.
         """
         gray_image = self.__preprocessing(msg)
         if gray_image is not None:
@@ -77,16 +100,9 @@ class MarkerDetector(Node):
         except CvBridgeError as e:
             self.get_logger().error(f"CvBridge Error: {e}")
             return None
-        gray_frame = self.__calibration(gray_image=gray_frame)
         # gray_frame = self.__image_filter(img=gray_frame)
         return gray_frame
 
-    def __calibration(self, gray_image: np.ndarray) -> np.ndarray:
-        """
-        Type 1 of preprocessing: apply camera calibration.
-        """
-        # TODO
-        return gray_image
 
     def __image_filter(
         self,
