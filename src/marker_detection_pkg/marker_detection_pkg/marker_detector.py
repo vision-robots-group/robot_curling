@@ -11,7 +11,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 import cv2
 import numpy as np
-import pupil_apriltags
+try:
+    import pupil_apriltags
+except ImportError:  # ARM (rover): no pupil wheels, dt_apriltags has the same API
+    import dt_apriltags as pupil_apriltags
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
 DEFAULTS = {
@@ -32,7 +35,9 @@ class MarkerDetector(Node):
         
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
-        self.detector: apriltag.Detector = apriltag.Detector()
+        self.april = [pupil_apriltags.Detector(families=f) for f in ("tag36h11", "tagStandard41h12")]
+        self.aruco = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), cv2.aruco.DetectorParameters())
         
 
     def __load_config(self):
@@ -47,7 +52,7 @@ class MarkerDetector(Node):
         """
         Return the image topic.
         """
-        if self.__calibration: return'/image_rect'
+        if self.calibration: return '/image_rect'
         else: return '/image_raw'
        
     def detect(self, gray_image: np.ndarray) -> DetectionArray:
