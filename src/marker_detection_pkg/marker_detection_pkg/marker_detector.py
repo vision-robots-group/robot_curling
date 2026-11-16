@@ -11,7 +11,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 import cv2
 import numpy as np
-import apriltag
+import pupil_apriltags
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
 DEFAULTS = {
@@ -24,7 +24,7 @@ class MarkerDetector(Node):
         super().__init__('marker_detector')
         self.__load_config()
         # ROS2 variables
-        self.image_topic = self.subscribe_to_img()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
+        self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
         self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.timer = self.create_timer(1.0, self.timer_callback)
@@ -43,14 +43,12 @@ class MarkerDetector(Node):
                 v = self.declare_parameter(k, default).value
                 setattr(self, k, v)
 
-    def subscribe_to_img(self) -> str:
+    def __get_image_topic(self) -> str:
         """
         Return the image topic.
         """
-        if self.__calibration:
-            return'/image_rect'
-        else:
-            return '/image_raw'
+        if self.__calibration: return'/image_rect'
+        else: return '/image_raw'
        
     def detect(self, gray_image: np.ndarray) -> DetectionArray:
         """
@@ -59,12 +57,16 @@ class MarkerDetector(Node):
         It contains the ``apriltag`` logic.
         """
         detection_array = DetectionArray()
-        results = self.detector.detect(gray_image)
+        tags = [(r.tag_id, r.tag_family.decode()) for det in self.april for r in det.detect(gray_image)]
+        corners, ids, _ = self.aruco.detectMarkers(gray_image)
+        if ids is not None:
+            tags += [(i, "aruco4x4_50") for i in ids.flatten().tolist()]
 
         # Fill the detection array
-        for r in results:
+        for tag_id, family in tags:
             detection = Detection()
-            detection.id = int(r.tag_id)
+            detection.id = int(tag_id)
+            detection.family = family
 
             # TODO: detect with camera information
             detection.dist = 0.0
