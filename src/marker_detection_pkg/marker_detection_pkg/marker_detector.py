@@ -23,7 +23,6 @@ from rclpy.qos import qos_profile_sensor_data
 DEFAULTS = {
     "calibration": True,
     "marker_size_m": 0.167,
-    "preprocessing": True,
 }
 
 class MarkerDetector(Node):
