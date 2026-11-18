@@ -23,6 +23,7 @@ from rclpy.qos import qos_profile_sensor_data
 DEFAULTS = {
     "calibration": True,
     "marker_size_m": 0.167,
+    "preprocessing": True,
 }
 
 class MarkerDetector(Node):
@@ -72,14 +73,7 @@ class MarkerDetector(Node):
         
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
-        self.april = pupil_apriltags.Detector(
-            families="tag36h11 tagStandard41h12",
-            nthreads=4,
-            quad_decimate=1.0,
-            quad_sigma=0.8,        
-            refine_edges=1,
-            decode_sharpening=0.25,
-        ) 
+        self.april = self.__detector() 
 
     def __load_config(self):
         """
@@ -95,7 +89,22 @@ class MarkerDetector(Node):
         """
         if self.calibration: return '/image_rect'
         else: return '/image_raw'
-        
+    def __detector(self) -> pupil_apriltags.Detector:
+        """
+        Return the AprilTag detector.
+        """
+        if self.preprocessing:
+            return pupil_apriltags.Detector(
+                families="tag36h11 tagStandard41h12",
+                nthreads=4,
+                quad_decimate=1.0,
+                quad_sigma=0.8,
+                refine_edges=1,
+                decode_sharpening=0.25,
+            )
+        else:
+            return  [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
+
     def camera_to_robot(self, position_camera, pan, tilt):
         """Convert camera optical coordinates into robot base_link coordinates."""
         pan_rotation = cv2.Rodrigues(np.array([0.0, 0.0, -pan]) )[0]

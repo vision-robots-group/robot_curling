@@ -2,3 +2,4 @@ marker_detector:
   ros__parameters:
     calibration: true    # true: /image_rect; false: /image_raw
     marker_size_m: 0.167  # size in meters of detected marker square (excluding surrounding paper)
+    preproc: true # applied to detector of apriltag
