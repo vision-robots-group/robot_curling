@@ -72,7 +72,7 @@ class MarkerDetector(Node):
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
-        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, qos_profile_sensor_data)
+        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
