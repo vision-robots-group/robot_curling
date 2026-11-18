@@ -23,6 +23,7 @@ from rclpy.qos import qos_profile_sensor_data
 DEFAULTS = {
     "calibration": True,
     "marker_size_m": 0.167,
+    "preprocessing": True,
 }
 
 class MarkerDetector(Node):
@@ -72,7 +73,14 @@ class MarkerDetector(Node):
         
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
-        self.april = [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
+        self.april = pupil_apriltags.Detector(
+            families="tag36h11 tagStandard41h12",
+            nthreads=4,
+            quad_decimate=1.0,
+            quad_sigma=0.8,        
+            refine_edges=1,
+            decode_sharpening=0.25,
+        ) 
 
     def __load_config(self):
         """
@@ -194,6 +202,8 @@ class MarkerDetector(Node):
         and the image filter."""
         try:
             gray_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8') # apriltag works with B/W images
+                
+
         except CvBridgeError as e:
             self.get_logger().error(f"CvBridge Error: {e}")
             return None
