@@ -47,13 +47,6 @@ class MarkerDetector(Node):
             @ cv2.Rodrigues(np.array([3.14, 0.0, 0.0]))[0]
         )
 
-        half = self.marker_size_m / 2
-        self.marker_points = np.array([
-            [-half,  half, 0.0],
-            [ half,  half, 0.0],
-            [ half, -half, 0.0],
-            [-half, -half, 0.0],
-        ], dtype=np.float64)
 
         def update_camera_info(msg):
             if self.calibration:
@@ -72,25 +65,22 @@ class MarkerDetector(Node):
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
-        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
+        self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, qos_profile_sensor_data )
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
         
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
-        self.april = [pupil_apriltags.Detector(families=f) for f in ("tag36h11", "tagStandard41h12")]
-        self.aruco = cv2.aruco.ArucoDetector(
-            cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), cv2.aruco.DetectorParameters())
-        
+        self.april = [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
 
     def __load_config(self):
-            """
-            Load the parameters (``--params-file config.yaml``).
-            """
-            for k, default in DEFAULTS.items():
-                v = self.declare_parameter(k, default).value
-                setattr(self, k, v)
+        """
+        Load the parameters (``--params-file config.yaml``).
+        """
+        for k, default in DEFAULTS.items():
+            v = self.declare_parameter(k, default).value
+            setattr(self, k, v)
 
     def __get_image_topic(self) -> str:
         """
@@ -122,53 +112,59 @@ class MarkerDetector(Node):
        
     def detect(self, gray_image: np.ndarray) -> DetectionArray:
         """
-        Main function that detects the markers and returns the array.
-        It is called by the listener callback.
-        It contains the ``apriltag`` logic.
+        Main function that detects the markers using apriltag 
+        and returns an array with marker, angle, distance.
         """
         detection_array = DetectionArray()
-        pan = self.joint_positions.get("pt_base_link_to_pt_link1", 0.0)
-        tilt = self.joint_positions.get("pt_link1_to_pt_link2", 0.0)
 
-        if self.camera_matrix is None:
+        K = self.camera_matrix
+        have_calibration = ( K is not None and K[0, 0] > 0 and K[1, 1] > 0 )
+
+        if have_calibration:
+            image = ( gray_image if self.calibration else cv2.undistort( gray_image, K, self.dist_coeffs, None, K ) )
+            camera_params = ( float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
+        else:
+            image = gray_image
+
+        image = np.ascontiguousarray(image)
+        tags = []
+
+        for detector in self.april:
+            if have_calibration:
+                tags.extend(detector.detect( image, estimate_tag_pose=True, camera_params=camera_params, tag_size=self.marker_size_m ))
+            else:
+                tags.extend(detector.detect(image))
+
+        self.get_logger().info( f"AprilTags detected: {len(tags)}; " f"IDs: {[tag.tag_id for tag in tags]}", throttle_duration_sec=5.0)
+
+        if not have_calibration:
+            self.get_logger().warning(
+                "AHHHHH! Distance unavailable: waiting for valid /camera_info",
+                throttle_duration_sec=5.0,
+            )
             return detection_array
 
-        tags = [
-            (r.tag_id, r.tag_family.decode(), r.corners)
-            for detector in self.april
-            for r in detector.detect(gray_image)
-        ]
+        pan = self.joint_positions.get("pt_base_link_to_pt_link1")
+        tilt = self.joint_positions.get("pt_link1_to_pt_link2")
 
-        corners, ids, _ = self.aruco.detectMarkers(gray_image)
-        if ids is not None:
-            tags += [
-                (int(marker_id), "aruco4x4_50", marker_corners)
-                for marker_id, marker_corners in zip(ids.flatten(), corners)
-            ]
+        if pan is None or tilt is None:
+            self.get_logger().warning(
+                "PANIC! Robot coordinates unavailable: waiting for pan/tilt positions on /ugv/joint_states",
+                throttle_duration_sec=5.0,
+            )
+            return detection_array
 
-        for tag_id, family, marker_corners in tags:
-            image_points = np.asarray( marker_corners, dtype=np.float64 ).reshape(4, 2)
+        for tag in tags:
+            position_camera = tag.pose_t.reshape(3)
 
-            # normalization of corner winding between AprilTag and ArUco.
-            following = np.roll(image_points, -1, axis=0)
-            signed_area =np.sum( image_points[:, 0]*following[:, 1] - image_points[:, 1]* following[:, 0])
-            
-            if signed_area < 0:
-                image_points = image_points[[0, 3, 2, 1]]
-
-            success, bla, tvec = cv2.solvePnP(self.marker_points, np.ascontiguousarray(image_points), 
-                                              self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-            
-            if ( not success or not np.isfinite(tvec).all() or tvec[2, 0] <= 0 ):
+            if ( not np.isfinite(position_camera).all() or position_camera[2] <= 0 ):
                 continue
 
-            # undoing rectification to recover physical optical coordinates
-            position_camera = self.rectification.T @ tvec.reshape(3)
-            position_robot = self.camera_to_robot(position_camera, pan, tilt)
-
+            position_camera = self.rectification.T @ position_camera
+            position_robot = self.camera_to_robot( position_camera, pan, tilt )
             detection = Detection()
-            detection.id = int(tag_id)
-            detection.family = family
+            detection.id = int(tag.tag_id)
+            detection.family = tag.tag_family.decode()
             detection.dist = self.calculate_marker_distance(position_robot)
             detection.theta = self.calculate_marker_angle(position_robot)
             detection_array.detections.append(detection)
