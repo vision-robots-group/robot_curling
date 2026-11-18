@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 try:
     import pupil_apriltags
-except ImportError:  # ARM (rover): no pupil wheels, dt_apriltags has the same API
+except ImportError:
     import dt_apriltags as pupil_apriltags
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
@@ -22,7 +22,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 DEFAULTS = {
     "calibration": True,
-    "marker_size_m": 0.30,
+    "marker_size_m": 0.167,
 }
 
 class MarkerDetector(Node):
@@ -72,7 +72,7 @@ class MarkerDetector(Node):
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
-        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, 10)
+        self.subscription_ =  self.create_subscription(Image, self.image_topic, self.listener_callback, qos_profile_sensor_data)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
@@ -127,10 +127,10 @@ class MarkerDetector(Node):
         It contains the ``apriltag`` logic.
         """
         detection_array = DetectionArray()
-        pan = self.joint_positions.get("pt_base_link_to_pt_link1")
-        tilt = self.joint_positions.get("pt_link1_to_pt_link2")
+        pan = self.joint_positions.get("pt_base_link_to_pt_link1", 0.0)
+        tilt = self.joint_positions.get("pt_link1_to_pt_link2", 0.0)
 
-        if self.camera_matrix is None or pan is None or tilt is None:
+        if self.camera_matrix is None:
             return detection_array
 
         tags = [
