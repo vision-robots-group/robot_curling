@@ -89,19 +89,19 @@ class MarkerDetector(Node):
         """
         if self.calibration: return '/image_rect'
         else: return '/image_raw'
+
     def __detector(self) -> pupil_apriltags.Detector:
         """
         Return the AprilTag detector.
         """
         if self.preprocessing:
-            return pupil_apriltags.Detector(
+            return [pupil_apriltags.Detector(
                 families="tag36h11 tagStandard41h12",
-                nthreads=4,
                 quad_decimate=1.0,
                 quad_sigma=0.8,
                 refine_edges=1,
-                decode_sharpening=0.25,
-            )
+                decode_sharpening=0.3,
+            )]
         else:
             return  [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
 
