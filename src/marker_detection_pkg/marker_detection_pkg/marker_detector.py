@@ -109,12 +109,13 @@ class MarkerDetector(Node):
         """
         if self.preprocessing:
             return [pupil_apriltags.Detector(
-                families="tag36h11 tagStandard41h12",
+                families=family,
                 quad_decimate=1.0,
                 quad_sigma=0.8,
                 refine_edges=1,
                 decode_sharpening=0.3,
-            )]
+                nthreads=4,) for family in ("tag36h11", "tagStandard41h12")]
+
         else:
             return  [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
 
