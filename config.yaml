@@ -1,5 +1,8 @@
 marker_detector:
   ros__parameters:
     calibration: true    # true: /image_rect; false: /image_raw
-    marker_size_m: 0.167  # size in meters of detected marker square (excluding surrounding paper)
-    preproc: true # applied to detector of apriltag
+    marker_size_m: 0.1402  # size in meters of detected marker square (excluding surrounding paper)
+    preprocessing: true    # tuned AprilTag detector settings (see __detector)
+    bb_show: true          # true: publish /marker_bb_image with bounding boxes
+    bb_colour: true        # true: boxes on the colour image; false: grey
+    use_compressed: true   # true: read <image topic>/compressed (much faster over Wi-Fi)

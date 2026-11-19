@@ -8,7 +8,7 @@ Or an array with int, float, float as the ID is an int.
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 import cv2
 import numpy as np
 try:
@@ -18,12 +18,16 @@ except ImportError:
 from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
 from sensor_msgs.msg import CameraInfo, JointState
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
+
 
 DEFAULTS = {
     "calibration": True,
     "marker_size_m": 0.167,
     "preprocessing": True,
+    "bb_show": True,
+    "bb_colour": True,          # draw on the colour image (false: grey)
+    "use_compressed": True,     # subscribe to <image topic>/compressed (JPEG, ~12x less Wi-Fi)
 }
 
 class MarkerDetector(Node):
@@ -64,16 +68,25 @@ class MarkerDetector(Node):
 
         self.camera_info_subscription = self.create_subscription( CameraInfo, "/camera_info", update_camera_info, qos_profile_sensor_data)
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
+
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
-        self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, qos_profile_sensor_data )
+        # depth 1: always process the newest frame (no backlog of old frames = no lag)
+        # best effort: the compressed topic only arrives with best effort
+        image_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+        if self.use_compressed:
+            self.subscription_ = self.create_subscription(CompressedImage, self.image_topic + '/compressed', self.listener_callback, image_qos)
+        else:
+            self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, image_qos)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
+        self.bb_publisher = self.create_publisher(Image, '/marker_bb_image', 1)
         self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
-        
+
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
-        self.april = self.__detector() 
+        self.undistort_maps = None   # cached maps for calibration=false (computed once, not every frame)
+        self.april = self.__detector()
 
     def __load_config(self):
         """
@@ -136,11 +149,10 @@ class MarkerDetector(Node):
         K = self.camera_matrix
         have_calibration = ( K is not None and K[0, 0] > 0 and K[1, 1] > 0 )
 
+        # calibration=false: the frame was already undistorted in __preprocessing (__undistort)
+        image = gray_image
         if have_calibration:
-            image = ( gray_image if self.calibration else cv2.undistort( gray_image, K, self.dist_coeffs, None, K ) )
             camera_params = ( float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
-        else:
-            image = gray_image
 
         image = np.ascontiguousarray(image)
         tags = []
@@ -150,6 +162,8 @@ class MarkerDetector(Node):
                 tags.extend(detector.detect( image, estimate_tag_pose=True, camera_params=camera_params, tag_size=self.marker_size_m ))
             else:
                 tags.extend(detector.detect(image))
+
+        self.bb_frame, self.bb_tags = image, tags
 
         self.get_logger().info( f"AprilTags detected: {len(tags)}; " f"IDs: {[tag.tag_id for tag in tags]}", throttle_duration_sec=5.0)
 
@@ -188,13 +202,46 @@ class MarkerDetector(Node):
         return detection_array
 
 
-    def listener_callback(self, msg: Image) -> DetectionArray:
+    def listener_callback(self, msg) -> None:
         """
-        ``/image_rect`` subscriber callback.
+        Image subscriber callback (``/image_rect`` or ``/image_raw``, raw or compressed).
         """
-        gray_image = self.__preprocessing(msg)
-        if gray_image is not None:
-            self.detections = self.detect(gray_image=gray_image)
+        colour, gray = self.__preprocessing(msg)
+        if gray is not None:
+            self.detections = self.detect(gray_image=gray)
+            if self.bb_show:
+                self.publisher_bb_image(msg.header, colour)
+
+    def publisher_bb_image(self, header, colour) -> None:
+        """Draw tag bounding boxes, ID, distance and angle; publish on /marker_bb_image."""
+        if self.bb_colour:
+            img = colour.copy()
+        else:
+            img = cv2.cvtColor(self.bb_frame, cv2.COLOR_GRAY2BGR)
+
+        info = {(d.family, d.id): d for d in self.detections.detections}
+        for tag in self.bb_tags:
+            family = tag.tag_family.decode()
+            cv2.polylines(img, [tag.corners.astype(int).reshape(-1, 1, 2)], True, (0, 255, 0), 2)
+            cx, cy = map(int, tag.center)
+            cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
+            text = f"#{tag.tag_id}"
+            d = info.get((family, tag.tag_id))
+            if d is not None:   # distance only exists once camera_info + joint_states arrived
+                text += f"  {d.dist:.2f} m  {np.degrees(d.theta):+.0f} deg"
+
+            # label above the box (below it if the tag touches the top of the image)
+            x_left = int(tag.corners[:, 0].min())
+            y_top, y_bottom = int(tag.corners[:, 1].min()), int(tag.corners[:, 1].max())
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            y = y_top - 8 if y_top - th - 12 > 0 else y_bottom + th + 8
+            cv2.rectangle(img, (x_left, y - th - 4), (x_left + tw + 4, y + 4), (0, 0, 0), -1)
+            cv2.putText(img, text, (x_left + 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        out = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
+        out.header = header
+        self.bb_publisher.publish(out)
+
 
     def timer_callback(self) -> None:
         """
@@ -204,19 +251,40 @@ class MarkerDetector(Node):
             self.publisher_.publish(self.detections)
 
 
-    def __preprocessing(self, msg: Image) -> np.ndarray|None:
+    def __preprocessing(self, msg):
         """
-        Convert to OpenCV, then apply preprocessing steps, like the calibration
-        and the image filter."""
+        Decode the image (raw or JPEG) into a colour frame, undistort it when
+        calibration=false, and make the grey frame used by AprilTag.
+        Returns (colour, gray), or (None, None) if the frame could not be decoded."""
         try:
-            gray_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8') # apriltag works with B/W images
-                
+            if self.use_compressed:
+                colour = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+            else:
+                colour = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except (CvBridgeError, cv2.error) as e:
+            self.get_logger().error(f"Image decode error: {e}")
+            return None, None
+        if colour is None:
+            return None, None
+        colour = self.__undistort(colour)
+        gray = cv2.cvtColor(colour, cv2.COLOR_BGR2GRAY)   # apriltag works with B/W images
+        # gray = self.__image_filter(img=gray)
+        return colour, gray
 
-        except CvBridgeError as e:
-            self.get_logger().error(f"CvBridge Error: {e}")
-            return None
-        # gray_frame = self.__image_filter(img=gray_frame)
-        return gray_frame
+    def __undistort(self, img: np.ndarray) -> np.ndarray:
+        """
+        calibration=false only: undistort /image_raw on the Mac with K and D.
+        The maps are computed once and reused (much faster than cv2.undistort every frame).
+        K is kept as the new camera matrix, so tags keep their full pixel size."""
+        K = self.camera_matrix
+        if self.calibration or K is None or K[0, 0] <= 0:
+            return img
+        h, w = img.shape[:2]
+        if (self.undistort_maps is None or self.undistort_maps[2] != (w, h)
+                or not np.array_equal(self.undistort_maps[3], K)):
+            map1, map2 = cv2.initUndistortRectifyMap(K, self.dist_coeffs, None, K, (w, h), cv2.CV_16SC2)
+            self.undistort_maps = (map1, map2, (w, h), K.copy())
+        return cv2.remap(img, self.undistort_maps[0], self.undistort_maps[1], cv2.INTER_LINEAR)
 
 
     def __image_filter(
