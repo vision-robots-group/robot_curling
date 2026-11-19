@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'localization = control_localization_pkg.localization:main',
         ],
     },
 )
