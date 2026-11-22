@@ -80,7 +80,6 @@ class MarkerDetector(Node):
             self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, image_qos)
         self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
         self.bb_publisher = self.create_publisher(Image, '/marker_bb_image', 1)
-        self.timer = self.create_timer(1.0, self.timer_callback)
         self.bridge = CvBridge()
 
         self.image: np.ndarray = None # b/w image mono8
@@ -209,8 +208,10 @@ class MarkerDetector(Node):
         colour, gray = self.__preprocessing(msg)
         if gray is not None:
             self.detections = self.detect(gray_image=gray)
+            self.publisher_.publish(self.detections) # publishing right after detectiosn
             if self.bb_show:
                 self.publisher_bb_image(msg.header, colour)
+            
 
     def publisher_bb_image(self, header, colour) -> None:
         """Draw tag bounding boxes, ID, distance and angle; publish on /marker_bb_image."""
@@ -241,14 +242,6 @@ class MarkerDetector(Node):
         out = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         out.header = header
         self.bb_publisher.publish(out)
-
-
-    def timer_callback(self) -> None:
-        """
-        ``/detected_markers`` publisher callback.
-        """
-        if self.detections is not None:
-            self.publisher_.publish(self.detections)
 
 
     def __preprocessing(self, msg):

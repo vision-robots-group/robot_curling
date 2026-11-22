@@ -6,3 +6,11 @@ marker_detector:
     bb_show: true          # true: publish /marker_bb_image with bounding boxes
     bb_colour: true        # true: boxes on the colour image; false: grey
     use_compressed: true   # true: read <image topic>/compressed (much faster over Wi-Fi)
+
+localization:
+  ros__parameters:
+    marker_map: '{}'  # "family:id": [field_x_metres, field_y_metres]
+    min_bearing_sin: 0.05   # [0, 1]; reject nearly collinear bearing geometry
+    distance_sigma_m: 0.15  # > 0; expected distance error, metres
+    bearing_sigma_rad: 0.10 # > 0; expected bearing error, radians
+    command_timeout_s: 0.5  # > 0; stop extrapolating an old velocity command
