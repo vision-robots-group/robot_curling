@@ -2,41 +2,31 @@ import math
 
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from geometry_msgs.msg import PoseStamped
 
-from .utils import State, wrap, DEFAULTS
+from .utils import State, wrap, DEFAULTS, TARGETS
 from .histogram_subscriber import ObjectDetectionSubscriber
 
 class Agent(Node):
     """
-    This agent will read the histogram from the topic ``/obj_detect`` and the pose from ``/odom``, and publish on the ``/cmd_vel`` topic.
-    It works as a state machine: each state has its own callback that returns the linear and angular velocity.
-
-    Object avoidance states:
-    - We are going straight on the line (CRUISE)
-    - An object is detected in front, we pick the side whose obstacle edge is closer and rotate towards it (TURN_AWAY)
-    - We keep going at that angle till the front is clear and we are far enough from the line (SIDESTEP)
-    - We go parallel to the line till we passed the object (PASS)
-    - We go back to CRUISE, whose line-following terms bring us back on the line
-
-    If both sides are blocked we rotate in place till the front is clear (CORNER).
-    If a new object shows up during avoidance, we just start again from TURN_AWAY.
+    Reads the lidar histogram and ``/field_pose``, publishes ``/cmd_vel``. State machine:
+    CRUISE (steer at the goal, DONE at ``stop_dist``) -> TURN_AWAY -> SIDESTEP -> PASS -> CRUISE.
+    CORNER spins in place when both sides are blocked. Before the first marker fix we drive straight.
     """
     def __init__(self, hist_sub: ObjectDetectionSubscriber):
         super().__init__('agent')
         self.hist_sub = hist_sub
-        self.origin = None # (x, y)
+        self.origin = None
         self.angle = 0.0
         self.hist = []
-        self.pose = None # (x, y, theta)
-        self.odom_stamp = None
-        self.imu_stamp = None
-        self.calib_start = None
-        self.gyro = []
-        self.bias = None
-        self.yaw = 0.0
-        self.x, self.y = 0.0, 0.0
+        self.pose = None
+        self.pose_stamp = None
+        self.anchored = False
+        self.was_anchored = False
+        self.start_heading = None
+        self.bearing = 0.0
+        self.dist = math.inf
+        self.goal = None
         self.heading = 0.0
         self.state = State.CRUISE
         self.sigma = 1
@@ -48,54 +38,33 @@ class Agent(Node):
             State.CRUISE: self.__cruise,
             State.TURN_AWAY: self.__turn_away,
             State.SIDESTEP: self.__clear_front,
-            State.PASS: self.__drive_by_obstacle
+            State.PASS: self.__drive_by_obstacle,
+            State.DONE: self.__done,
         }
 
         self.__load_config()
 
-        self.create_subscription(Odometry, self.odom_topic, self.__odom_callback, 10)
-        self.create_subscription(Imu, self.imu_topic, self.__imu_callback, 50)
+        self.create_subscription(PoseStamped, self.pose_topic, self.__pose_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.timer = self.create_timer(1.0 / self.rate, self.step)
 
     def __load_config(self):
-        """
-        Load the parameters (``--params-file config.yaml``).
-        """
         for k, default in DEFAULTS.items():
             v = self.declare_parameter(k, default).value
-            if k.endswith('_deg'): setattr(self, k[:-4], math.radians(v)) # convert to radians if in degrees
+            if k.endswith('_deg'): setattr(self, k[:-4], math.radians(v))
             else: setattr(self, k, v)
-
-
-
-    def __odom_callback(self, msg):
-        """
-        Odometry callback, integrates the wheel speed along the gyro yaw into the pose (x, y, theta).
-        """
-        now = self.get_clock().now()
-        if self.bias is not None and self.odom_stamp is not None:
-            ds = msg.twist.twist.linear.x * (now - self.odom_stamp).nanoseconds / 1e9
-            self.x += ds * math.cos(self.yaw)
-            self.y += ds * math.sin(self.yaw)
-            self.pose = (self.x, self.y, self.yaw)
-        self.odom_stamp = now
-
-    def __imu_callback(self, msg):
-        now = self.get_clock().now()
-        gz = msg.angular_velocity.z
-        if self.bias is None:
-            if self.calib_start is None: self.calib_start = now
-            self.gyro.append(gz)
-            if (now - self.calib_start).nanoseconds / 1e9 >= self.calib_time:
-                self.bias = sum(self.gyro) / len(self.gyro)
-        elif self.imu_stamp is not None:
-            self.yaw = wrap(self.yaw + (gz - self.bias) * (now - self.imu_stamp).nanoseconds / 1e9)
-        self.imu_stamp = now
-
+        if math.isfinite(self.goal_x) and math.isfinite(self.goal_y):
+            self.goal = (self.goal_x, self.goal_y)
+        else:
+            self.goal = TARGETS[self.goal_name]
+        self.get_logger().info(f'Goal: {self.goal}, stop {self.stop_dist} m before it')
+    def __pose_callback(self, msg):
+        q = msg.pose.orientation
+        self.pose = (msg.pose.position.x, msg.pose.position.y, 2.0 * math.atan2(q.z, q.w))
+        self.anchored = msg.header.frame_id == 'map'
+        self.pose_stamp = self.get_clock().now()
 
     def publish_cmd(self, v, w):
-        """Used to publish to ``/cmd_vel``."""
         msg = Twist()
         msg.linear.x = float(v)
         msg.angular.z = float(w)
@@ -105,48 +74,59 @@ class Agent(Node):
         """Control loop. Execute on each timer tick."""
         hist = self.hist_sub.read()
         now = self.get_clock().now()
-        fresh = all(t is not None and 0 <= (now - t).nanoseconds / 1e9 <= self.odom_max_age
-                    for t in (self.odom_stamp, self.imu_stamp))
+        fresh = self.pose_stamp is not None and 0 <= (now - self.pose_stamp).nanoseconds / 1e9 <= self.pose_max_age
         if hist is None or self.pose is None or not fresh:
-            self.publish_cmd(0.0, 0.0) # no fresh data, stop
+            self.publish_cmd(0.0, 0.0)
             return
-        self.hist = hist
 
         x, y, th = self.pose
-        if self.origin is None: # first pose, save the reference line
-            self.origin, self.angle = (x, y), th
-        s, e = self.__errors(x, y)
+        if self.start_heading is None:
+            self.start_heading = th
+        if self.anchored != self.was_anchored:
+            self.was_anchored = self.anchored
+            if self.state != State.DONE: self.state = State.CRUISE
+
+        if self.anchored:
+            self.dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
+            self.bearing = math.atan2(self.goal[1] - y, self.goal[0] - x)
+            self.hist = self.__drop_goal(hist, x, y, th)
+            if self.dist <= self.stop_dist: self.state = State.DONE
+        else:
+            self.dist, self.bearing, self.hist = math.inf, self.start_heading, hist
+
         front_blocked = any(self.__in_front(d, a) for d, a in self.hist if abs(a) <= self.fov)
         prev = self.state
 
-        # new object in front: start the avoidance again
-        if front_blocked and self.state not in (State.CORNER, State.TURN_AWAY):
+        if front_blocked and self.state not in (State.CORNER, State.TURN_AWAY, State.DONE):
             if self.state == State.CRUISE:
-                self.sigma = self.__pick_side(e)
+                self.origin, self.angle = (x, y), self.bearing
+                self.sigma = self.__pick_side(0.0)
                 self.state = State.TURN_AWAY
             else:
                 self.state = State.CORNER
 
+        s, e = self.__errors(x, y) if self.origin is not None else (0.0, 0.0)
         v, w = self.callback_dict[self.state](th, s, e, front_blocked)
         if self.state != prev:
             self.get_logger().info(f'{prev.name} -> {self.state.name}')
         self.publish_cmd(v, max(-self.omega_max, min(self.omega_max, w)))
 
+    def __drop_goal(self, hist, x, y, th):
+        keep = []
+        for d, a in hist:
+            if math.isfinite(d):
+                px, py = x + d * math.cos(th + a), y + d * math.sin(th + a)
+                if math.hypot(px - self.goal[0], py - self.goal[1]) < self.goal_ignore_radius: continue
+            keep.append((d, a))
+        return keep
+
     def __errors(self, x, y):
-        """
-        Progress along the line (``s``) and distance from it (``e``, > 0 if left of the line).
-        """
         dx, dy = x - self.origin[0], y - self.origin[1]
         s = dx * math.cos(self.angle) + dy * math.sin(self.angle)
         e = -dx * math.sin(self.angle) + dy * math.cos(self.angle)
         return s, e
 
     def __hold(self, th, target):
-        """
-        Used to turn the robot towards the target angle and keep it there.
-        It uses a proportional controller and bounds the angular velocity to omega_max.
-        We want to slow down when close to the target angle, and this is a simple way to do it.
-        """
         w = self.k_theta * wrap(target - th)
         return max(-self.omega_max, min(self.omega_max, w))
 
@@ -180,14 +160,12 @@ class Agent(Node):
         k = max(0.0, min(1.0, (min(front) - self.safe_distance) / self.ramp))
         return v_min + k * (self.v_max - v_min)
 
-
-
     def __cruise(self, th, s, e, front_blocked):
-        """Cruise: just follow the line."""
-        return self.__speed(self.v_slow), -self.k_e * e + self.k_theta * wrap(self.angle - th)
+        v = self.__speed(self.v_slow)
+        if self.dist < self.goal_slow_dist: v = min(v, self.v_slow)
+        return v, self.k_theta * wrap(self.bearing - th)
 
     def __turn_away(self, th, s, e, front_blocked):
-        """Turn away: spin toward the free side."""
         if not self.__side_clear(1) and not self.__side_clear(-1):
             self.state = State.CORNER
             return 0.0, 0.0
@@ -198,19 +176,19 @@ class Agent(Node):
         return self.v_turn, self.__hold(th, target)
 
     def __clear_front(self, th, s, e, front_blocked):
-        """Sidestep: slide sideways till the front is free."""
         self.clear_count = 0 if front_blocked else self.clear_count + 1
         if self.clear_count >= self.clear_ticks and abs(e) >= self.e_min:
             self.state, self.s_pass = State.PASS, s
         return self.v_slow, self.__hold(th, self.heading)
 
     def __drive_by_obstacle(self, th, s, e, front_blocked):
-        """Pass: go straight next to the obstacle."""
         if not self.__side_clear(-self.sigma): self.s_pass = s
         elif s - self.s_pass >= self.pass_min: self.state = State.CRUISE
         return self.__speed(self.v_slow), self.__hold(th, self.angle)
 
     def __corner(self, th, s, e, front_blocked):
-        """Corner: stuck, spin in place till something opens up."""
         if not front_blocked: self.state, self.clear_count, self.heading = State.SIDESTEP, 0, th
         return 0.0, self.sigma * self.omega_max
+
+    def __done(self, th, s, e, front_blocked):
+        return 0.0, 0.0
