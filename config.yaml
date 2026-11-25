@@ -52,3 +52,23 @@ localization:
     distance_sigma_m: 0.15  # > 0; expected distance error, metres
     bearing_sigma_rad: 0.10 # > 0; expected bearing error, radians
     command_timeout_s: 0.5  # > 0; stop extrapolating an old velocity command
+    
+    odom_topic: /odom
+    imu_topic: /imu/data_raw
+    calib_time: 3.0         # s; rover must stand still while the gyro bias is estimated
+    odom_max_age: 0.5       # s; odom/imu older than this = lost, pose not published
+    pos_gain: 0.3           # [0, 1]; share of a marker position fix applied to the pose
+    heading_gain: 0.2       # [0, 1]; share of a marker heading fix applied to the pose
+    max_jump_m: 0.5         # m; fixes further than this from the pose are held back
+    max_rejects: 5          # consecutive held-back fixes before markers are trusted anyway
+
+agent:
+  ros__parameters:
+    pose_topic: /field_pose
+    goal_name: penalty_mark   # penalty_mark | goal_corner_right | goal_corner_left | penalty_corner_right | penalty_corner_left
+    # goal_x: 3.20            # optional: explicit duck position, overrides goal_name (set both)
+    # goal_y: 0.00
+    stop_dist: 0.15           # m; stop this far from the duck
+    goal_slow_dist: 0.8       # m; drive at v_slow closer than this
+    goal_ignore_radius: 0.35  # m; lidar points this close to the goal are the duck, not an obstacle
+    pose_max_age: 0.5         # s; stop the rover if /field_pose is older
