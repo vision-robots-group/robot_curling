@@ -7,6 +7,7 @@ import numpy as np
 from typing import Optional, Tuple
 from itertools import combinations
 from geometry_msgs.msg import PoseStamped, Twist
+from sensor_msgs.msg import JointState
 
 
 DEFAULTS = {
@@ -29,6 +30,10 @@ DEFAULTS = {
     "distance_sigma_m": 0.15,
     "bearing_sigma_rad": 0.10,
     "command_timeout_s": 0.5,
+    "camera_auto": True,
+    "camera_max_distance_m": 4.0,
+    "camera_fov_deg": 120.0,
+    "camera_tilt_deg": 0.0,
 }
 
 
@@ -44,6 +49,89 @@ TARGETS = {
 
 def wrap_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
+
+
+# marker normals in field coordinates, keyed by physical marker ID.
+MARKER_NORMALS = {
+    "0": (-1.0, 0.0),
+    "1": (0.0, 1.0),
+    "2": (0.0, -1.0),
+    "3": (0.0, 1.0),
+    "4": (0.0, -1.0),
+    "5": (-1.0, 0.0),
+}
+
+
+def optimal_tilt_camera(pose, markers, current_pan=0.0, max_distance=4.0, fov_deg=120.0, marker_normals=None, min_bearing_sin=0.05):
+    """Return a pan command in radians; None means hold the current view.    """
+    if pose is None:
+        return None
+
+    x, y, heading = pose
+    observations = []
+    seen = set()
+    
+    for key, point in markers.items():
+        point = np.asarray(point, dtype=float)
+        identity = tuple(point)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        delta = point - np.array([x, y])
+        distance = float(np.linalg.norm(delta))
+        if not 0.25 <= distance <= max_distance:
+            continue
+        normal = (marker_normals or {}).get(key.rsplit(":", 1)[-1])
+        if normal is not None and np.dot(-delta, normal) <= 0:
+            continue
+
+        bearing = float(wrap_angle(np.arctan2(delta[1], delta[0]) - heading))
+        observations.append((bearing, distance))
+
+    if not observations:
+        return None
+
+    angles = np.array([item[0] for item in observations])
+    distances = np.array([item[1] for item in observations])
+    half_fov = np.deg2rad(fov_deg) / 2
+
+    def evaluate(pan):
+        inside = np.flatnonzero(np.abs(wrap_angle(angles + pan)) <= half_fov)
+        usable = any(
+            abs(np.sin(angles[j] - angles[i])) >= min_bearing_sin
+            for i, j in combinations(inside, 2)
+        )
+        if not usable:
+            return None
+        return ( -len(inside), float(np.max(distances[inside])), abs(pan - current_pan))
+
+    candidates = [current_pan]
+    
+    for i, j in combinations(range(len(angles)), 2):
+        separation = float(wrap_angle(angles[j] - angles[i]))
+        if abs(separation) > 2 * half_fov:
+            continue
+        centre = float(wrap_angle(angles[i] + separation / 2))
+        candidates.append(float(np.clip(-centre, -3.14, 3.14)))
+
+    choices = []
+    for pan in candidates:
+        score = evaluate(pan)
+        if score is not None:
+            choices.append((score, pan))
+
+    if choices:
+        best_score, best_pan = min(choices, key=lambda item: item[0])
+        current_score = evaluate(current_pan)
+        # keeps a view unless proximity improves by more than 15%
+        if (current_score is not None and current_score[0] == best_score[0]
+                and current_score[1] <= 1.15 * best_score[1]):
+            return current_pan
+        return best_pan
+
+    # if no usable pair fits: we aim at the nearest single marker
+    return float(np.clip(-angles[np.argmin(distances)], -3.14, 3.14))
 
 
 class Localization(Node):
@@ -68,6 +156,9 @@ class Localization(Node):
         self.subscriber = self.create_subscription( DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
         self.command_subscriber = self.create_subscription( Twist, "/cmd_vel", self._command_callback, 10 )
         self.pose_publisher = self.create_publisher( PoseStamped, "/field_pose", 10 )
+        self.camera_publisher = self.create_publisher( JointState, "/ugv/joint_states", 10 )
+        self.camera_last_update = float("-inf")
+        self.camera_last_pan = None
         self.timer = self.create_timer(0.05, self._tick)
 
         if not self.markers:
@@ -209,6 +300,37 @@ class Localization(Node):
 
         self.last_update = now
 
+    def _aim_camera(self, now):
+        """Sends both joint positions, at most twice per second after a recent fix"""
+        if (not self.camera_auto or self.pose is None or self.last_fix is None
+                or now - self.last_fix > 2.0
+                or now - self.camera_last_update < 0.5):
+            return
+        self.camera_last_update = now
+        current_pan = self.camera_last_pan if self.camera_last_pan is not None else 0.0
+        
+        pan = optimal_tilt_camera(
+            self.pose, self.markers, current_pan=current_pan,
+            max_distance=self.camera_max_distance_m,
+            fov_deg=self.camera_fov_deg, marker_normals=MARKER_NORMALS,
+            min_bearing_sin=self.min_bearing_sin,
+        )
+        
+        if pan is None:
+            return
+        if (self.camera_last_pan is not None and abs(pan - self.camera_last_pan) < np.deg2rad(5.0)):
+            return
+
+        command = JointState()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.name = ["pt_base_link_to_pt_link1", "pt_link1_to_pt_link2"]
+        command.position = [
+            float(pan),
+            float(np.clip(np.deg2rad(self.camera_tilt_deg), -0.5233333, 1.5707963)),
+        ]
+        self.camera_publisher.publish(command)
+        self.camera_last_pan = pan
+
     def _tick(self):
         self._predict()
 
@@ -223,6 +345,7 @@ class Localization(Node):
             self.get_logger().warning( "Field pose is OLD", throttle_duration_sec=5.0, )
             return
 
+        self._aim_camera(now)
         x, y, heading = self.pose
 
         msg = PoseStamped()
