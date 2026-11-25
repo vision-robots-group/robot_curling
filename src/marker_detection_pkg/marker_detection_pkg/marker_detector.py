@@ -16,6 +16,7 @@ Camera -> robot conversion:
   (only valid for the pan-tilt camera, frame ``pt_camera_link``).
 """
 
+import array
 import traceback
 
 import rclpy
@@ -331,7 +332,9 @@ class MarkerDetector(Node):
         out.encoding = 'bgr8'
         out.is_bigendian = 0
         out.step = img.shape[1] * 3
-        out.data = img.tobytes()
+        # array('B'): rclpy takes it as is. Plain bytes are checked byte by byte in Python,
+        # which costs ~170 ms per OAK frame (1280x720) and ~60 ms per pan-tilt frame.
+        out.data = array.array('B', img.tobytes())
         out.header = header
         self.bb_publisher.publish(out)
 
