@@ -6,6 +6,30 @@ marker_detector:
     bb_show: true          # true: publish /marker_bb_image with bounding boxes
     bb_colour: true        # true: boxes on the colour image; false: grey
     use_compressed: true   # true: read <image topic>/compressed (much faster over Wi-Fi)
+    use_tf: true           # true: camera -> base_link from TF; false: hand-written pan-tilt geometry
+
+# Only used by launch/two_cameras.launch.py (both cameras + fusion)
+marker_detector_oak:
+  ros__parameters:
+    image_topic: /oak/rgb/image_raw          # OAK-D Lite RGB, 1280x720
+    camera_info_topic: /oak/rgb/camera_info
+    detections_topic: /detected_markers_oak
+    bb_image_topic: /marker_bb_image_oak
+    calibration: false     # undistort on the Mac with the OAK's own factory calibration (K, D)
+    marker_size_m: 0.1402  # keep equal to marker_detector
+    preprocessing: true
+    bb_show: true
+    bb_colour: true
+    use_compressed: true
+    use_tf: true           # required for the OAK (the pan-tilt geometry does not apply)
+
+marker_fusion:
+  ros__parameters:
+    input_topics: [/detected_markers_pt, /detected_markers_oak]
+    input_weights: [1.0, 1.0]   # trust per camera; raise one if it proves more accurate
+    output_topic: /detected_markers
+    max_age_s: 0.3              # ignore a camera whose last list is older (detectors publish every frame)
+    disagree_warn_m: 0.3        # warn when the cameras place the same marker this far apart
 
 localization:
   ros__parameters:
@@ -27,6 +51,8 @@ localization:
     min_bearing_sin: 0.05   # [0, 1]; reject nearly collinear bearing geometry
     distance_sigma_m: 0.15  # > 0; expected distance error, metres
     bearing_sigma_rad: 0.10 # > 0; expected bearing error, radians
+    command_timeout_s: 0.5  # > 0; stop extrapolating an old velocity command
+    
     odom_topic: /odom
     imu_topic: /imu/data_raw
     calib_time: 3.0         # s; rover must stand still while the gyro bias is estimated
