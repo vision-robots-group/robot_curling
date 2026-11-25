@@ -62,8 +62,37 @@ localization:
     max_jump_m: 0.5         # m; fixes further than this from the pose are held back
     max_rejects: 5          # consecutive held-back fixes before markers are trusted anyway
 
+
+detection_node:
+  ros__parameters:
+    safe_distance: 1.0      # m
+    danger_zone_factor: 1.2 # objects within safe_distance * danger_zone_factor are processed
+    hist_fov_deg: 120.0     # < 360; total coverage 120 = -60 to +60 degrees
+    bin_width_deg: 5.0      # angular width of each bin; must divide hist_fov_deg
+
 agent:
   ros__parameters:
+    # avoidance (from robot_vision_obstacle_avoidance)
+    safe_distance: 0.5      # m
+    half_width: 0.2         # m
+    fov_deg: 30.0           # front cone half-width
+    side_start_deg: 10.0
+    side_limit_deg: 45.0
+    v_max: 0.5              # m/s
+    v_slow: 0.2             # m/s
+    v_turn: 0.1             # m/s, 0 = turn in place
+    omega_max: 0.5          # rad/s
+    theta_avoid_deg: 45.0
+    theta_tol_deg: 5.0
+    e_min: 0.4              # m
+    pass_min: 0.5           # m
+    clear_ticks: 3
+    near_dist: 1.5
+    ramp: 1.0
+    k_theta: 1.5
+    rate: 10.0              # Hz
+
+    # goal
     pose_topic: /field_pose
     goal_name: penalty_mark   # penalty_mark | goal_corner_right | goal_corner_left | penalty_corner_right | penalty_corner_left
     # goal_x: 3.20            # optional: explicit duck position, overrides goal_name (set both)
