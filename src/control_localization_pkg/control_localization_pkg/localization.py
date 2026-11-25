@@ -10,6 +10,9 @@ from geometry_msgs.msg import PoseStamped, Twist
 
 
 DEFAULTS = {
+
+    # The lines of the field are 5cm large. We may need to remove 2.5cm from some of the measurements.
+
     "marker_map": json.dumps({
       "tag36h11:0": [-0.725,  0.000],
       "tag36h11:1": [-1.495, -3.000],
