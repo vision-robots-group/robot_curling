@@ -10,7 +10,21 @@ from geometry_msgs.msg import PoseStamped, Twist
 
 
 DEFAULTS = {
-    "marker_map": "{}",
+    marker_map: {
+      "tag36h11:0": [-0.725,  0.000],
+      "tag36h11:1": [-1.495, -3.000],
+      "tag36h11:2": [-1.475,  3.000],
+      "tag36h11:3": [ 1.560, -3.000],
+      "tag36h11:4": [ 1.545,  3.000],
+      "tag36h11:5": [ 4.500,  0.000],
+
+      "tagStandard41h12:0": [-0.725,  0.000],
+      "tagStandard41h12:1": [-1.495, -3.000],
+      "tagStandard41h12:2": [-1.475,  3.000],
+      "tagStandard41h12:3": [ 1.560, -3.000],
+      "tagStandard41h12:4": [ 1.545,  3.000],
+      "tagStandard41h12:5": [ 4.500,  0.000]
+    },
     "min_bearing_sin": 0.05,
     "distance_sigma_m": 0.15,
     "bearing_sigma_rad": 0.10,
