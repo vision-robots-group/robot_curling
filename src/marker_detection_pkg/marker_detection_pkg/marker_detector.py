@@ -1,13 +1,26 @@
 """
-This class will subscribe to the pan-tilt camera (subscribe to ``/image_rect`` and publish to ``/detected_markers``)
+AprilTag marker detector for ONE camera.
 
-The type will be Float32 or somethng with less bits.
-The format is the following: obj1_id, obj1_d, obj1_theta, ..., objn_id, objn_d, objn_theta.
-Or an array with int, float, float as the ID is an int.
+Subscribes to a camera (default: the pan-tilt camera, ``/image_rect``) and publishes the
+detected markers (id, family, distance, angle in ``base_link``) on ``/detected_markers``.
+
+The same node can run on any camera (e.g. the OAK-D RGB camera) by changing the topic
+parameters; see ``config.yaml`` (section ``marker_detector_oak``) and
+``launch/two_cameras.launch.py``, which runs one detector per camera plus ``marker_fusion``.
+
+Camera -> robot conversion:
+- ``use_tf: true`` (default): the pose is transformed with TF from the image's frame
+  (``header.frame_id``) to ``base_link``. Works for every camera, pan/tilt included
+  (the rover's robot_state_publisher broadcasts the pan/tilt joints on /tf).
+- ``use_tf: false`` or TF not available yet: the hand-written pan-tilt geometry below
+  (only valid for the pan-tilt camera, frame ``pt_camera_link``).
 """
+
+import traceback
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import Image, CompressedImage
 import cv2
 import numpy as np
@@ -19,6 +32,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
 from sensor_msgs.msg import CameraInfo, JointState
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
+from tf2_ros import Buffer, TransformListener, TransformException
 
 
 DEFAULTS = {
@@ -28,11 +42,32 @@ DEFAULTS = {
     "bb_show": True,
     "bb_colour": True,          # draw on the colour image (false: grey)
     "use_compressed": True,     # subscribe to <image topic>/compressed (JPEG, ~12x less Wi-Fi)
+    # Which camera (defaults = pan-tilt camera, same behaviour as before)
+    "image_topic": "",          # "" = /image_rect (calibration true) or /image_raw (false)
+    "camera_info_topic": "/camera_info",
+    "detections_topic": "/detected_markers",
+    "bb_image_topic": "/marker_bb_image",
+    # Camera -> robot conversion
+    "use_tf": True,             # true: TF (any camera); false: hand-written pan-tilt geometry
+    "robot_frame": "base_link",
 }
+
+PAN_TILT_FRAME = "pt_camera_link"   # frame_id of the pan-tilt camera images
+
+
+def quaternion_to_matrix(q) -> np.ndarray:
+    """Rotation matrix from a geometry_msgs Quaternion (x, y, z, w)."""
+    x, y, z, w = q.x, q.y, q.z, q.w
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
 
 class MarkerDetector(Node):
     def __init__(self):
-        super().__init__('marker_detector')
+        super().__init__('marker_detector')   # the launch file can rename it (e.g. marker_detector_oak)
         self.__load_config()
         self.camera_matrix = None
         self.dist_coeffs = None
@@ -66,8 +101,12 @@ class MarkerDetector(Node):
         def update_joint_positions(msg):
             self.joint_positions.update(zip(msg.name, msg.position))
 
-        self.camera_info_subscription = self.create_subscription( CameraInfo, "/camera_info", update_camera_info, qos_profile_sensor_data)
+        self.camera_info_subscription = self.create_subscription( CameraInfo, self.camera_info_topic, update_camera_info, qos_profile_sensor_data)
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
+
+        # TF: where is the camera relative to base_link (pan/tilt included)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ROS2 variables
         self.image_topic = self.__get_image_topic()# rectified feed from `ros2 launch ugv_vision camera.launch.py`
@@ -78,8 +117,11 @@ class MarkerDetector(Node):
             self.subscription_ = self.create_subscription(CompressedImage, self.image_topic + '/compressed', self.listener_callback, image_qos)
         else:
             self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, image_qos)
-        self.publisher_ = self.create_publisher(DetectionArray, '/detected_markers', 10)
-        self.bb_publisher = self.create_publisher(Image, '/marker_bb_image', 1)
+        self.publisher_ = self.create_publisher(DetectionArray, self.detections_topic, 10)
+        self.bb_publisher = self.create_publisher(Image, self.bb_image_topic, 1)
+        self.get_logger().info(
+            f"camera: {self.image_topic}{'/compressed' if self.use_compressed else ''} -> {self.detections_topic}"
+            f" ({'TF' if self.use_tf else 'pan-tilt geometry'})")
         self.bridge = CvBridge()
 
         self.image: np.ndarray = None # b/w image mono8
@@ -99,6 +141,7 @@ class MarkerDetector(Node):
         """
         Return the image topic.
         """
+        if self.image_topic: return self.image_topic   # set in config.yaml (e.g. the OAK camera)
         if self.calibration: return '/image_rect'
         else: return '/image_raw'
 
@@ -110,7 +153,8 @@ class MarkerDetector(Node):
         kwargs = {}
         if self.preprocessing:
             kwargs = dict(quad_sigma=0.0, refine_edges=1, decode_sharpening=0.25)
-        return [pupil_apriltags.Detector(families=family, quad_decimate=1.0, **kwargs)
+        # nthreads=4: ~2x faster on the Mac (OAK 1280x720: 94 -> 41 ms per frame)
+        return [pupil_apriltags.Detector(families=family, quad_decimate=1.0, nthreads=4, **kwargs)
                 for family in ("tag36h11", "tagStandard41h12")]
 
     def camera_to_robot(self, position_camera, pan, tilt):
@@ -121,6 +165,21 @@ class MarkerDetector(Node):
         position = ( self.camera_mount_rotation @ np.asarray(position_camera).reshape(3) + self.camera_origin)
         position = ( self.tilt_mount_rotation @ (tilt_rotation @ position) + self.tilt_origin )
         return pan_rotation @ position + self.pan_origin
+
+    def lookup_camera_pose(self, header):
+        """
+        TF: rotation R and translation t with p_robot = R @ p_camera + t, for the camera
+        that took this image (header.frame_id). Uses the transform at the image time;
+        if that is not available (yet), the latest one. Returns None if TF has no answer.
+        """
+        for stamp in (Time.from_msg(header.stamp), Time()):
+            try:
+                tr = self.tf_buffer.lookup_transform(self.robot_frame, header.frame_id, stamp)
+            except TransformException:
+                continue
+            v = tr.transform.translation
+            return quaternion_to_matrix(tr.transform.rotation), np.array([v.x, v.y, v.z])
+        return None
 
 
     def calculate_marker_distance(self, position_robot):
@@ -134,10 +193,11 @@ class MarkerDetector(Node):
         x, y, _ = position_robot
         return float(np.arctan2(y, x))
        
-    def detect(self, gray_image: np.ndarray) -> DetectionArray:
+    def detect(self, gray_image: np.ndarray, header=None) -> DetectionArray:
         """
-        Main function that detects the markers using apriltag 
+        Main function that detects the markers using apriltag
         and returns an array with marker, angle, distance.
+        ``header`` (of the image) is needed for TF: frame_id and time.
         """
         detection_array = DetectionArray()
 
@@ -169,15 +229,30 @@ class MarkerDetector(Node):
             )
             return detection_array
 
-        pan = self.joint_positions.get("pt_base_link_to_pt_link1")
-        tilt = self.joint_positions.get("pt_link1_to_pt_link2")
+        # Camera -> robot: TF first (any camera), else the hand-written pan-tilt geometry
+        camera_pose = None
+        if self.use_tf and header is not None and header.frame_id:
+            camera_pose = self.lookup_camera_pose(header)
 
-        if pan is None or tilt is None:
-            self.get_logger().warning(
-                "PANIC! Robot coordinates unavailable: waiting for pan/tilt positions on /ugv/joint_states",
-                throttle_duration_sec=5.0,
-            )
-            return detection_array
+        if camera_pose is None:
+            frame = header.frame_id if header is not None else PAN_TILT_FRAME
+            if frame and frame != PAN_TILT_FRAME:
+                self.get_logger().warning(
+                    f"PANIC! Robot coordinates unavailable: no TF from '{frame}' to '{self.robot_frame}'"
+                    " (is the camera's launch file running on the rover?)",
+                    throttle_duration_sec=5.0,
+                )
+                return detection_array
+
+            pan = self.joint_positions.get("pt_base_link_to_pt_link1")
+            tilt = self.joint_positions.get("pt_link1_to_pt_link2")
+
+            if pan is None or tilt is None:
+                self.get_logger().warning(
+                    "PANIC! Robot coordinates unavailable: waiting for pan/tilt positions on /ugv/joint_states",
+                    throttle_duration_sec=5.0,
+                )
+                return detection_array
 
         for tag in tags:
             position_camera = tag.pose_t.reshape(3)
@@ -185,8 +260,20 @@ class MarkerDetector(Node):
             if ( not np.isfinite(position_camera).all() or position_camera[2] <= 0 ):
                 continue
 
+            # Detection.id is int8 (-128..127). A higher id (another team's tag, or a false
+            # detection) would crash the node, so it is skipped and reported instead.
+            if not -128 <= int(tag.tag_id) <= 127:
+                self.get_logger().warning(
+                    f"skipping {tag.tag_family.decode()} #{tag.tag_id}: id does not fit in Detection.id (int8, max 127)",
+                    throttle_duration_sec=5.0)
+                continue
+
             position_camera = self.rectification.T @ position_camera
-            position_robot = self.camera_to_robot( position_camera, pan, tilt )
+            if camera_pose is not None:
+                rotation, translation = camera_pose
+                position_robot = rotation @ position_camera + translation
+            else:
+                position_robot = self.camera_to_robot( position_camera, pan, tilt )
             detection = Detection()
             detection.id = int(tag.tag_id)
             detection.family = tag.tag_family.decode()
@@ -201,16 +288,19 @@ class MarkerDetector(Node):
         """
         Image subscriber callback (``/image_rect`` or ``/image_raw``, raw or compressed).
         """
-        colour, gray = self.__preprocessing(msg)
-        if gray is not None:
-            self.detections = self.detect(gray_image=gray)
-            self.publisher_.publish(self.detections) # publishing right after detectiosn
-            if self.bb_show:
-                self.publisher_bb_image(msg.header, colour)
-            
+        try:
+            colour, gray = self.__preprocessing(msg)
+            if gray is not None:
+                self.detections = self.detect(gray_image=gray, header=msg.header)
+                self.publisher_.publish(self.detections) # publishing right after detections
+                if self.bb_show:
+                    self.publisher_bb_image(msg.header, colour)
+        except Exception:   # one bad frame must not kill the detector: log it and go on
+            self.get_logger().error(f"frame skipped after an error:\n{traceback.format_exc()}",
+                                    throttle_duration_sec=5.0)
 
     def publisher_bb_image(self, header, colour) -> None:
-        """Draw tag bounding boxes, ID, distance and angle; publish on /marker_bb_image."""
+        """Draw tag bounding boxes, ID, distance and angle; publish on bb_image_topic (/marker_bb_image)."""
         if self.bb_colour:
             img = colour.copy()
         else:
