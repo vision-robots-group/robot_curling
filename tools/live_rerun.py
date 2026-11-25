@@ -41,6 +41,10 @@ except ImportError:          # workspace not sourced: everything except the mark
 
 ROBOT_FRAME = 'base_link'
 BEST_EFFORT = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+# The box images are big (OAK: 1280x720 raw = 2.7 MB) and are split into many network packets.
+# With best effort ONE lost packet loses the whole image (measured: 0 OAK images in 8 s);
+# reliable resends lost packets (35 in 8 s). They are made on this Mac, so this costs no Wi-Fi.
+RELIABLE = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
 
 # (source name, colour) for the marker topics; "fused" is the final /detected_markers
 MARKER_TOPICS = {
@@ -64,7 +68,13 @@ def quaternion_to_matrix(q):
 def blueprint():
     return rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Spatial3DView(origin='top', name='top view (x forward, y left)'),
+            rrb.Spatial3DView(
+                origin='top', name='top view (x forward, y left)',
+                # camera behind and above the robot, turning around the robot centre (0, 0, 0);
+                # forward (x) points up the screen
+                eye_controls=rrb.EyeControls3D(kind=rrb.Eye3DKind.Orbital, position=[-4.0, 0.0, 5.0],
+                                               look_target=[0.0, 0.0, 0.0], eye_up=[0.0, 0.0, 1.0]),
+            ),
             rrb.Vertical(
                 rrb.Spatial2DView(origin='cameras/pantilt', name='pan-tilt camera'),
                 rrb.Spatial2DView(origin='cameras/oak', name='OAK camera'),
@@ -95,7 +105,7 @@ class LiveRerun(Node):
                 self.create_subscription(CompressedImage, topic, lambda m, n=name: self.on_jpeg(n, m), BEST_EFFORT)
         else:
             for topic, name in BB_TOPICS.items():
-                self.create_subscription(Image, topic, lambda m, n=name: self.on_image(n, m), BEST_EFFORT)
+                self.create_subscription(Image, topic, lambda m, n=name: self.on_image(n, m), RELIABLE)
         self.create_timer(5.0, self.check_images)
         self.create_subscription(LaserScan, '/scan', self.on_scan, BEST_EFFORT)
         if DetectionArray is not None:
@@ -137,10 +147,15 @@ class LiveRerun(Node):
                                         colors=[[120, 120, 120]]), static=True)
         rr.log('top/robot/heading', rr.Arrows3D(origins=[[0, 0, 0.1]], vectors=[[0.25, 0, 0]],
                                                  colors=[[255, 255, 0]]), static=True)
+        radii_m = (1, 2, 3, 4, 5)
         rings = [[(r * math.cos(a), r * math.sin(a), 0.0) for a in np.linspace(0, 2 * math.pi, 73)]
-                 for r in (1, 2, 3, 4, 5)]
-        rr.log('top/rings', rr.LineStrips3D(rings, colors=[[70, 70, 70]], labels=[f'{r} m' for r in (1, 2, 3, 4, 5)]),
-               static=True)
+                 for r in radii_m]
+        rr.log('top/rings', rr.LineStrips3D(rings, colors=[[70, 70, 70]]), static=True)
+        # Rerun puts a line's label at the line's centre (= the robot for a circle), so the
+        # labels sit on small points ON each ring, straight in front of the robot (+x)
+        rr.log('top/rings/labels', rr.Points3D([[r, 0.0, 0.0] for r in radii_m], radii=0.02,
+                                               colors=[[110, 110, 110]], labels=[f'{r} m' for r in radii_m],
+                                               show_labels=True), static=True)
 
     # ---- callbacks --------------------------------------------------------------------------
     def on_jpeg(self, name: str, msg: CompressedImage):
