@@ -8,9 +8,15 @@ from typing import Optional, Tuple
 from itertools import combinations
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 
 
 DEFAULTS = {
+
+    # The lines of the field are 5cm large. We may need to remove 2.5cm from some of the measurements.
+
     "marker_map": json.dumps({
       "tag36h11:0": [-0.725,  0.000],
       "tag36h11:1": [-1.495, -3.000],
@@ -34,6 +40,14 @@ DEFAULTS = {
     "camera_max_distance_m": 4.0,
     "camera_fov_deg": 120.0,
     "camera_tilt_deg": 0.0,
+    "odom_topic": "/odom",
+    "imu_topic": "/imu/data_raw",
+    "calib_time": 3.0,        # s; gyroscope bias estimation
+    "odom_max_age": 0.5,      # s; message older than this => lost
+    "pos_gain": 0.3,          # [0, 1]; share of a marker position fix applied to the pose
+    "heading_gain": 0.2,      # [0, 1]; share of a marker heading fix applied to the pose
+    "max_jump_m": 0.5,        # m; marker fixes further than this from the pose are suspicious
+    "max_rejects": 5,         # consecutive suspicious fixes before we trust the markers anyway
 }
 
 
@@ -146,12 +160,16 @@ class Localization(Node):
             for key, xy in json.loads(self.marker_map).items()
         }
 
-        self.pose = None
+        self.pose = None          # (x, y, heading); odom frame until anchored, field frame after
+        self.anchored = False     # True after the first marker fix
         self.last_fix = None
+        self.rejects = 0
 
-        self.velocity = (0.0, 0.0)
-        self.last_command = None
-        self.last_update = self.now_seconds()
+        self.odom_stamp = None
+        self.imu_stamp = None
+        self.calib_start = None
+        self.gyro = []
+        self.bias = None
 
         self.subscriber = self.create_subscription( DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
         self.command_subscriber = self.create_subscription( Twist, "/cmd_vel", self._command_callback, 10 )
@@ -159,6 +177,10 @@ class Localization(Node):
         self.camera_publisher = self.create_publisher( JointState, "/ugv/joint_states", 10 )
         self.camera_last_update = float("-inf")
         self.camera_last_pan = None
+        self.create_subscription(DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
+        self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
+        self.create_subscription(Imu, self.imu_topic, self._imu_callback, 50)
+        self.pose_publisher = self.create_publisher(PoseStamped, "/field_pose", 10)
         self.timer = self.create_timer(0.05, self._tick)
 
         if not self.markers:
@@ -172,7 +194,8 @@ class Localization(Node):
         return f"{detection.family}:{detection.id}"            
                 
     def _marker_detection_callback(self, msg):
-        self._predict()
+        if self.pose is None:
+            return # odometry not calibrated yet
 
         # unknown and repeating markers are discarded
         known = {
@@ -206,8 +229,29 @@ class Localization(Node):
                 best_pose = candidate
 
         if best_pose is not None:
-            self.pose = best_pose
-            self.last_fix = self.now_seconds()
+            self._apply_fix(best_pose)
+
+    def _apply_fix(self, fix):
+        """Blend a marker fix into the odometry pose (first fix anchors the field frame)."""
+        self.last_fix = self.now_seconds()
+
+        if not self.anchored:
+            self.pose, self.anchored = fix, True
+            self.get_logger().info("Anchored to field frame by first marker fix.")
+            return
+
+        x, y, h = self.pose
+        fx, fy, fh = fix
+        if np.hypot(fx - x, fy - y) > self.max_jump_m and self.rejects < self.max_rejects:
+            self.rejects += 1 # likely outlier or mirror solution
+            return
+        self.rejects = 0
+
+        self.pose = (
+            float(x + self.pos_gain * (fx - x)),
+            float(y + self.pos_gain * (fy - y)),
+            float(wrap_angle(h + self.heading_gain * wrap_angle(fh - h))),
+        )
 
     def __triangulation_2p(self, detections) -> Optional[Tuple[float, float]]:
         first, second = detections
@@ -271,34 +315,34 @@ class Localization(Node):
 
         return score
 
-    def _command_callback(self, msg):
-        # Integrates the previous command before replacing it
-        self._predict()
-        self.velocity = (msg.linear.x, msg.angular.z)
-        self.last_command = self.now_seconds()
+    def _imu_callback(self, msg):
+        """Gyro: calibrate the bias while standing still, then integrate the heading."""
+        now = self.get_clock().now()
+        gz = msg.angular_velocity.z
 
-    def _predict(self):
-        now = self.now_seconds()
+        if self.bias is None:
+            if self.calib_start is None:
+                self.calib_start = now
+            self.gyro.append(gz)
+            if (now - self.calib_start).nanoseconds * 1e-9 >= self.calib_time:
+                self.bias = sum(self.gyro) / len(self.gyro)
+                self.pose = (0.0, 0.0, 0.0)
+                self.get_logger().info(f"Gyro bias {self.bias:.5f} rad/s, odometry started.")
+        elif self.imu_stamp is not None and self.pose is not None:
+            dt = (now - self.imu_stamp).nanoseconds * 1e-9
+            x, y, h = self.pose
+            self.pose = (x, y, float(wrap_angle(h + (gz - self.bias) * dt)))
+        self.imu_stamp = now
 
-        if self.pose is not None and self.last_command is not None:
-            # Integrates only the portion before the command expires
-            end = min( now, self.last_command + self.command_timeout_s )
-            dt = max(0.0, end - self.last_update)
-
-            x, y, heading = self.pose
-            speed, turn_rate = self.velocity
-            half_turn = turn_rate * dt / 2.0
-
-            # exact constant-velocity integration
-            travel = speed * dt * np.sinc(half_turn / np.pi)
-
-            x += travel * np.cos(heading + half_turn)
-            y += travel * np.sin(heading + half_turn)
-            heading = wrap_angle(heading + turn_rate * dt)
-
-            self.pose = (float(x), float(y), float(heading))
-
-        self.last_update = now
+    def _odom_callback(self, msg):
+        """Wheel speed integrated along the current heading."""
+        now = self.get_clock().now()
+        if self.pose is not None and self.odom_stamp is not None:
+            dt = (now - self.odom_stamp).nanoseconds * 1e-9
+            ds = msg.twist.twist.linear.x * dt
+            x, y, h = self.pose
+            self.pose = (float(x + ds * np.cos(h)), float(y + ds * np.sin(h)), h)
+        self.odom_stamp = now
 
     def _aim_camera(self, now):
         """Sends both joint positions, at most twice per second after a recent fix"""
@@ -332,36 +376,30 @@ class Localization(Node):
         self.camera_last_pan = pan
 
     def _tick(self):
-        self._predict()
+        if self.pose is None: return
 
-        if self.pose is None:
-            return
-
-        now = self.now_seconds()
-        command_recent = ( self.last_command is not None and now - self.last_command <= self.command_timeout_s )
-
-        # keeping old estimate internally but knowing that its old
-        if now - self.last_fix > 1.0 and not command_recent:
-            self.get_logger().warning( "Field pose is OLD", throttle_duration_sec=5.0, )
+        now = self.get_clock().now()
+        ages = [(now - t).nanoseconds * 1e-9 for t in (self.odom_stamp, self.imu_stamp) if t is not None]
+        if len(ages) < 2 or max(ages) > self.odom_max_age:
+            self.get_logger().warning("Odometry/IMU lost, pose not published", throttle_duration_sec=5.0)
             return
 
         self._aim_camera(now)
         x, y, heading = self.pose
 
         msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "map"
+        msg.header.stamp = now.to_msg()
+        msg.header.frame_id = "map" if self.anchored else "odom" # "odom": not yet tied to the field
         msg.pose.position.x = x
         msg.pose.position.y = y
         msg.pose.orientation.z = float(np.sin(heading / 2))
         msg.pose.orientation.w = float(np.cos(heading / 2))
         self.pose_publisher.publish(msg)
 
-        # info for debugging 
+        fix_age = f"{self.now_seconds() - self.last_fix:.1f}s ago" if self.last_fix else "never"
         self.get_logger().info(
-            f"Field pose: x={x:.2f}, y={y:.2f}, "
-            f"heading={np.degrees(heading):.1f} deg; "
-            f"last marker fix {now - self.last_fix:.1f}s ago",
+            f"Field pose: x={x:.2f}, y={y:.2f}, heading={np.degrees(heading):.1f} deg; "
+            f"frame={msg.header.frame_id}; last marker fix {fix_age}",
             throttle_duration_sec=1.0,
         )
 
