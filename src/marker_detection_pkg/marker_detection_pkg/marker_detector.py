@@ -239,7 +239,13 @@ class MarkerDetector(Node):
             cv2.rectangle(img, (x_left, y - th - 4), (x_left + tw + 4, y + 4), (0, 0, 0), -1)
             cv2.putText(img, text, (x_left + 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-        out = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
+        img = np.ascontiguousarray(img, dtype=np.uint8)
+        out = Image()
+        out.height, out.width = img.shape[:2]
+        out.encoding = 'bgr8'
+        out.is_bigendian = 0
+        out.step = img.shape[1] * 3
+        out.data = img.tobytes()
         out.header = header
         self.bb_publisher.publish(out)
 
