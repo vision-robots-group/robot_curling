@@ -141,10 +141,15 @@ class LiveRerun(Node):
                                         colors=[[120, 120, 120]]), static=True)
         rr.log('top/robot/heading', rr.Arrows3D(origins=[[0, 0, 0.1]], vectors=[[0.25, 0, 0]],
                                                  colors=[[255, 255, 0]]), static=True)
+        radii_m = (1, 2, 3, 4, 5)
         rings = [[(r * math.cos(a), r * math.sin(a), 0.0) for a in np.linspace(0, 2 * math.pi, 73)]
-                 for r in (1, 2, 3, 4, 5)]
-        rr.log('top/rings', rr.LineStrips3D(rings, colors=[[70, 70, 70]], labels=[f'{r} m' for r in (1, 2, 3, 4, 5)]),
-               static=True)
+                 for r in radii_m]
+        rr.log('top/rings', rr.LineStrips3D(rings, colors=[[70, 70, 70]]), static=True)
+        # Rerun puts a line's label at the line's centre (= the robot for a circle), so the
+        # labels sit on small points ON each ring, straight behind the robot (rarely a marker there)
+        rr.log('top/rings/labels', rr.Points3D([[-r, 0.0, 0.0] for r in radii_m], radii=0.02,
+                                               colors=[[110, 110, 110]], labels=[f'{r} m' for r in radii_m],
+                                               show_labels=True), static=True)
 
     # ---- callbacks --------------------------------------------------------------------------
     def on_jpeg(self, name: str, msg: CompressedImage):
