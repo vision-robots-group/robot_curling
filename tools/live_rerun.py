@@ -68,7 +68,13 @@ def quaternion_to_matrix(q):
 def blueprint():
     return rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Spatial3DView(origin='top', name='top view (x forward, y left)'),
+            rrb.Spatial3DView(
+                origin='top', name='top view (x forward, y left)',
+                # camera behind and above the robot, turning around the robot centre (0, 0, 0);
+                # forward (x) points up the screen
+                eye_controls=rrb.EyeControls3D(kind=rrb.Eye3DKind.Orbital, position=[-4.0, 0.0, 5.0],
+                                               look_target=[0.0, 0.0, 0.0], eye_up=[0.0, 0.0, 1.0]),
+            ),
             rrb.Vertical(
                 rrb.Spatial2DView(origin='cameras/pantilt', name='pan-tilt camera'),
                 rrb.Spatial2DView(origin='cameras/oak', name='OAK camera'),
@@ -146,8 +152,8 @@ class LiveRerun(Node):
                  for r in radii_m]
         rr.log('top/rings', rr.LineStrips3D(rings, colors=[[70, 70, 70]]), static=True)
         # Rerun puts a line's label at the line's centre (= the robot for a circle), so the
-        # labels sit on small points ON each ring, straight behind the robot (rarely a marker there)
-        rr.log('top/rings/labels', rr.Points3D([[-r, 0.0, 0.0] for r in radii_m], radii=0.02,
+        # labels sit on small points ON each ring, straight in front of the robot (+x)
+        rr.log('top/rings/labels', rr.Points3D([[r, 0.0, 0.0] for r in radii_m], radii=0.02,
                                                colors=[[110, 110, 110]], labels=[f'{r} m' for r in radii_m],
                                                show_labels=True), static=True)
 
