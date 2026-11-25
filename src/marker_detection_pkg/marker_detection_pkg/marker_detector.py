@@ -106,16 +106,12 @@ class MarkerDetector(Node):
         """
         Return the AprilTag detector.
         """
+        # one detector per family: multi-family string finds nothing
+        kwargs = {}
         if self.preprocessing:
-            return [pupil_apriltags.Detector(
-                families="tag36h11 tagStandard41h12",
-                quad_decimate=1.0,
-                quad_sigma=0.8,
-                refine_edges=1,
-                decode_sharpening=0.3,
-            )]
-        else:
-            return  [pupil_apriltags.Detector( families=family, quad_decimate=1.0) for family in ("tag36h11", "tagStandard41h12") ]
+            kwargs = dict(quad_sigma=0.0, refine_edges=1, decode_sharpening=0.25)
+        return [pupil_apriltags.Detector(families=family, quad_decimate=1.0, **kwargs)
+                for family in ("tag36h11", "tagStandard41h12")]
 
     def camera_to_robot(self, position_camera, pan, tilt):
         """Convert camera optical coordinates into robot base_link coordinates."""
