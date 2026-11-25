@@ -10,7 +10,7 @@ from geometry_msgs.msg import PoseStamped, Twist
 
 
 DEFAULTS = {
-    marker_map: {
+    "marker_map": {
       "tag36h11:0": [-0.725,  0.000],
       "tag36h11:1": [-1.495, -3.000],
       "tag36h11:2": [-1.475,  3.000],
