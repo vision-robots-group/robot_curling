@@ -75,7 +75,8 @@ class Agent(Node):
         hist = self.hist_sub.read()
         now = self.get_clock().now()
         fresh = self.pose_stamp is not None and 0 <= (now - self.pose_stamp).nanoseconds / 1e9 <= self.pose_max_age
-        if hist is None or self.pose is None or not fresh:
+        blind = hist is None or not any(math.isfinite(d) for d, _ in hist)
+        if blind or self.pose is None or not fresh:
             self.publish_cmd(0.0, 0.0)
             return
 

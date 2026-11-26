@@ -170,7 +170,7 @@ def _run(sensor_class, args=None):
         for node in (detector, sensor):
             node.destroy_node()
 
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 def main(args=None):

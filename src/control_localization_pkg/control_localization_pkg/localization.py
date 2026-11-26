@@ -6,7 +6,6 @@ from robot_interfaces.msg import DetectionArray
 import numpy as np
 from typing import Optional, Tuple
 from itertools import combinations
-from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
@@ -171,9 +170,6 @@ class Localization(Node):
         self.gyro = []
         self.bias = None
 
-        self.subscriber = self.create_subscription( DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
-        self.command_subscriber = self.create_subscription( Twist, "/cmd_vel", self._command_callback, 10 )
-        self.pose_publisher = self.create_publisher( PoseStamped, "/field_pose", 10 )
         self.camera_publisher = self.create_publisher( JointState, "/ugv/joint_states", 10 )
         self.camera_last_update = float("-inf")
         self.camera_last_pan = None
@@ -384,7 +380,7 @@ class Localization(Node):
             self.get_logger().warning("Odometry/IMU lost, pose not published", throttle_duration_sec=5.0)
             return
 
-        self._aim_camera(now)
+        self._aim_camera(self.now_seconds())
         x, y, heading = self.pose
 
         msg = PoseStamped()

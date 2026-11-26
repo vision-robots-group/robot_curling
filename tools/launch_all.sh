@@ -58,21 +58,28 @@ PIDS=()
 start() { # start <name> <command...>: run in the background with its own log
     local name="$1"; shift
     echo "[launch_all] starting $name"
-    "$@" >"$LOGDIR/$name.log" 2>&1 &
+    setsid "$@" >"$LOGDIR/$name.log" 2>&1 &
     PIDS+=($!)
 }
 
 stop_all() {
-    trap - INT TERM EXIT
+    trap - EXIT
+    trap '' INT TERM HUP
     echo; echo "[launch_all] stopping..."
     # stop the agent first so the rover halts before its inputs disappear
-    for ((i=${#PIDS[@]}-1; i>=0; i--)); do kill -INT "${PIDS[$i]}" 2>/dev/null; done
-    sleep 2
-    for pid in "${PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null; done
+    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
+        kill -INT -- "-${PIDS[$i]}" 2>/dev/null
+        for _ in {1..20}; do
+            kill -0 -- "-${PIDS[$i]}" 2>/dev/null || break
+            sleep 0.1
+        done
+    done
+    for pid in "${PIDS[@]}"; do kill -KILL -- "-$pid" 2>/dev/null; done
     wait 2>/dev/null
     echo "[launch_all] logs in $LOGDIR"
 }
-trap stop_all INT TERM EXIT
+trap stop_all EXIT
+trap 'exit 130' INT TERM HUP
 
 if [ "$RUN_HW" = 1 ]; then
     start bringup ros2 launch ugv_bringup bringup_lidar.launch.py

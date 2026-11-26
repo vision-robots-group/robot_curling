@@ -2,6 +2,8 @@
 Main file spinning ROS nodes for obstacle avoidance.
 """
 
+import signal
+
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.signals import SignalHandlerOptions
@@ -13,6 +15,9 @@ from .histogram_subscriber import ObjectDetectionSubscriber
 def main(args=None):
     # no rclpy signal handler, so the context is still valid to stop the rover on Ctrl-C
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
     hist_sub = ObjectDetectionSubscriber()
     agent = Agent(hist_sub)
@@ -26,6 +31,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         agent.get_logger().warn(f'Shutting down in state {agent.state.name}')
         agent.publish_cmd(0.0, 0.0)
         executor.shutdown()
