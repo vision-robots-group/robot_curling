@@ -52,6 +52,9 @@ DEFAULTS = {
     "camera_max_distance_m": 4.0,
     "camera_fov_deg": 120.0,
     "camera_tilt_deg": 0.0,
+    # pan/tilt command topic: the rover's joint_state_publisher must list it in its
+    # source_list, otherwise its 10 Hz zeros on /ugv/joint_states override every command
+    "camera_cmd_topic": "/ugv/pt_cmd",
     "odom_topic": "/odom",
     "imu_topic": "/imu/data_raw",
     "calib_time": 3.0,        # s; gyroscope bias estimation
@@ -306,7 +309,7 @@ class Localization(Node):
             if len(self.segments) == 0:
                 self.get_logger().warning("lidar_height_m above the barriers and boxes: nothing to match")
 
-        self.camera_publisher = self.create_publisher( JointState, "/ugv/joint_states", 10 )
+        self.camera_publisher = self.create_publisher(JointState, self.camera_cmd_topic, 10)
         self.camera_last_update = float("-inf")
         self.camera_last_pan = None
         self.create_subscription(DetectionArray, "/detected_markers", self._marker_detection_callback, 10)

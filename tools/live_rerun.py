@@ -264,8 +264,8 @@ class LiveRerun(Node):
         self.fix_ghost_on = False
         self.last_fixable = None     # last time /detected_markers had >= 1 known marker (EKF can correct)
         self.sigma = None            # EKF (sigma x, sigma y, sigma heading) from /field_pose_cov
-        self.pan_cmd = None          # (time, pan, tilt) last 2-joint command on /ugv/joint_states
-        self.jsp_zero = None         # last time a full joint message with pan 0 arrived (joint_state_publisher)
+        self.pan_cmd = None          # (time, pan, tilt) last aim command on /ugv/pt_cmd (localization)
+        self.jsp_pan = None          # (time, pan) last pan joint_state_publisher sent on /ugv/joint_states
         self.info_text = None
         self.lidar_fix = None        # (time, x, y, heading, inliers, rms) from /lidar_fix
         self.lidar_fix_ghost_on = False
@@ -296,6 +296,7 @@ class LiveRerun(Node):
             self.create_subscription(PoseWithCovarianceStamped, '/lidar_fix', self.on_lidar_fix, 10)
             # gimbal: commands from localization (2 joints) vs joint_state_publisher (all joints, zeros)
             self.create_subscription(JointState, '/ugv/joint_states', self.on_joint_states, qos_profile_sensor_data)
+            self.create_subscription(JointState, '/ugv/pt_cmd', self.on_pt_cmd, 10)
             self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
             for topic, name in CAMERA_INFO_TOPICS.items():
                 self.create_subscription(CameraInfo, topic, lambda m, n=name: self.on_camera_info(n, m),
@@ -556,14 +557,15 @@ class LiveRerun(Node):
         if 'plots' in self.show:
             self.log_pose_plots('lidar', x, y, heading)
 
+    def on_pt_cmd(self, msg: JointState):
+        pos = dict(zip(msg.name, msg.position))
+        if 'pt_base_link_to_pt_link1' in pos:
+            self.pan_cmd = (self.now_s(), pos['pt_base_link_to_pt_link1'], pos.get('pt_link1_to_pt_link2', 0.0))
+
     def on_joint_states(self, msg: JointState):
         pos = dict(zip(msg.name, msg.position))
-        if 'pt_base_link_to_pt_link1' not in pos:
-            return
-        if len(msg.name) <= 2:        # a pan-tilt command (localization's camera aiming)
-            self.pan_cmd = (self.now_s(), pos['pt_base_link_to_pt_link1'], pos.get('pt_link1_to_pt_link2', 0.0))
-        elif abs(pos['pt_base_link_to_pt_link1']) < 1e-9:
-            self.jsp_zero = self.now_s()
+        if 'pt_base_link_to_pt_link1' in pos:
+            self.jsp_pan = (self.now_s(), pos['pt_base_link_to_pt_link1'])
 
     @staticmethod
     def log_pose_plots(source, x, y, heading):
@@ -638,13 +640,14 @@ class LiveRerun(Node):
             lines.append(f'**Lidar match (magenta):** x {lx:+.2f} · y {ly:+.2f} · {math.degrees(lh):+.0f}° '
                          f'{n} points on the map, rms {rms * 100:.1f} cm ({age(lt)}){diff}')
         # 3. gimbal
-        if self.pan_cmd is not None or self.jsp_zero is not None:
+        if self.pan_cmd is not None:
             g = []
-            if self.pan_cmd is not None:
-                g.append(f'last aim command pan {math.degrees(self.pan_cmd[1]):+.0f}° tilt '
-                         f'{math.degrees(self.pan_cmd[2]):+.0f}° ({age(self.pan_cmd[0])})')
-            if self.jsp_zero is not None and now - self.jsp_zero < 1.0:
-                g.append('joint_state_publisher is sending pan 0° (it overrides the aim commands!)')
+            g.append(f'last aim command pan {math.degrees(self.pan_cmd[1]):+.0f}° tilt '
+                     f'{math.degrees(self.pan_cmd[2]):+.0f}° ({age(self.pan_cmd[0])})')
+            if (self.jsp_pan is not None and now - self.jsp_pan[0] < 1.0 and self.jsp_pan[0] > self.pan_cmd[0] + 0.5
+                    and abs(self.jsp_pan[1] - self.pan_cmd[1]) > math.radians(1.0)):
+                g.append(f'/ugv/joint_states pan is {math.degrees(self.jsp_pan[1]):+.0f}°, not the command: '
+                         'joint_state_publisher is not merging /ugv/pt_cmd (source_list)!')
             lines.append('**Gimbal:** ' + '  ·  '.join(g))
         cams = []
         for name, label in (('pantilt', 'pan-tilt'), ('oak', 'OAK')):
