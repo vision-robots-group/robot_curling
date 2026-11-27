@@ -66,10 +66,34 @@ localization:
     odom_noise_frac: 0.10     # std of travelled distance as a fraction of it (wheel slip)
     pos_process_sigma: 0.03   # m/sqrt(s); slow position diffusion
     gyro_noise_sigma: 0.02    # rad/sqrt(s); heading random walk
+    gyro_scale_noise_frac: 0.05 # std of a measured rotation as a fraction of it (gyro scale error)
     init_pos_sigma: 0.15      # m; uncertainty right after a triangulation anchor
     init_heading_sigma: 0.15  # rad
     gate_chi2: 9.21           # per-marker Mahalanobis^2 gate (chi2 2 dof, 99%)
     max_rejects: 5            # frames with all markers gated out -> re-anchor by triangulation
+
+    # Lidar scan matching: the scan is aligned to the red barriers + marker boxes (field_map.py)
+    # and corrects the EKF. Calibrate the mount with tools/calibrate_lidar.py.
+    lidar_enabled: true
+    scan_topic: /scan
+    robot_frame: base_link
+    lidar_rate_hz: 5.0        # scan matches per second
+    lidar_use_tf: true        # mount = TF base_link <- scan frame + offsets; false = offsets only
+    lidar_yaw_offset_deg: 0.0
+    lidar_x_offset_m: 0.0
+    lidar_y_offset_m: 0.0
+    lidar_height_m: 0.20      # MEASURE: beam height above the floor (barrier faces slope in above 0.144 m)
+    lidar_min_range: 0.15     # m
+    lidar_max_range: 6.0      # m
+    lidar_min_inliers: 40     # points within 10 cm of the map to accept a match
+    lidar_max_rms: 0.08       # m
+    lidar_cov_inflate: 8.0    # scan points are correlated: inflate the ICP covariance
+    lidar_gate_chi2: 11.34    # chi2 3 dof 99 %
+    lidar_max_omega: 0.6      # rad/s; skip scans while turning faster
+    lidar_triang_weight: 10.0 # scan fit weight when choosing among triangulation candidates
+    lidar_max_gated: 5        # good lidar matches gated out in a row -> EKF reset to the lidar pose
+    lidar_reanchor: false     # experimental: re-find the pose from the scan alone when lost
+    lidar_max_rejects: 10
 
 
 detection_node:
@@ -91,7 +115,7 @@ agent:
     v_slow: 0.2             # m/s
     v_turn: 0.1             # m/s, 0 = turn in place
     omega_max: 0.5          # rad/s
-    theta_avoid_deg: 45.0
+    theta_avoid_deg: 30.0   # was 45; smaller = shallower turn, hugs obstacle closer
     theta_tol_deg: 5.0
     e_min: 0.4              # m
     pass_min: 0.5           # m

@@ -12,6 +12,8 @@ Panels (choose with --show, default "curling" = field,top,cameras):
             CYAN = independent reference: the pose the markers of each single /detected_markers
             message give (rigid fit onto the marker map), never used for the grey robot.
             Blue line = localization trail; cyan dots = every raw marker pose (its noise).
+            MAGENTA = the pose the lidar scan alone gives (/lidar_fix: scan aligned to the
+            barriers + boxes); pink lines on the field = the map it is aligned to.
             Debug layers on the robot: lidar, camera views (FOV), a ray per camera to every
             marker it detects, /cmd_vel, line to the goal. A status panel on top says where
             the pose comes from, what each camera sees now, and how old everything is.
@@ -109,7 +111,7 @@ RING_RADII = (1, 2, 3, 4, 5)
 COLOURS = dict(box=(24, 24, 24), box_seen=(40, 210, 80), box_edge=(110, 110, 110), paper=(240, 240, 240),
                tag=(10, 10, 10), target=(255, 220, 0), trail=(80, 160, 255), goal=(255, 220, 0),
                lidar=(230, 60, 60), cmd=(255, 0, 255), goal_frame=(20, 20, 20), goal_net=(55, 55, 55),
-               fix=(0, 220, 220), uncertainty=(255, 235, 60))
+               fix=(0, 220, 220), uncertainty=(255, 235, 60), lidar_fix=(230, 60, 230), lidar_map=(255, 90, 200))
 FIX_MIN_MARKERS = 2          # the viewer's own pose from the markers needs at least this many
 
 
@@ -138,7 +140,12 @@ def load_config(path):
         goal_name, goal = 'goal', (float(agent['goal_x']), float(agent['goal_y']))
     return dict(markers=markers, goal_name=goal_name, goal=goal,
                 tag_size=float(det.get('marker_size_m', 0.1402)),
-                fov_range=float(loc.get('camera_max_distance_m', 4.0)))
+                fov_range=float(loc.get('camera_max_distance_m', 4.0)),
+                # lidar mount, same rule as localization.py: TF (if used) + offsets
+                lidar_use_tf=bool(loc.get('lidar_use_tf', True)),
+                lidar_offset=(float(loc.get('lidar_x_offset_m', 0.0)), float(loc.get('lidar_y_offset_m', 0.0)),
+                              math.radians(float(loc.get('lidar_yaw_offset_deg', 0.0)))),
+                lidar_height=float(loc.get('lidar_height_m', 0.20)))
 
 
 def pose_from_markers(detections, markers):
@@ -260,6 +267,8 @@ class LiveRerun(Node):
         self.pan_cmd = None          # (time, pan, tilt) last 2-joint command on /ugv/joint_states
         self.jsp_zero = None         # last time a full joint message with pan 0 arrived (joint_state_publisher)
         self.info_text = None
+        self.lidar_fix = None        # (time, x, y, heading, inliers, rms) from /lidar_fix
+        self.lidar_fix_ghost_on = False
 
         self.image_topics = {}
         if 'cameras' in show:
@@ -283,6 +292,8 @@ class LiveRerun(Node):
             self.create_subscription(PoseStamped, '/field_pose', self.on_pose, 10)
             # EKF uncertainty (localization publishes the same pose with its covariance)
             self.create_subscription(PoseWithCovarianceStamped, '/field_pose_cov', self.on_pose_cov, 10)
+            # the pose the lidar scan alone gives (aligned to barriers + boxes), magenta ghost
+            self.create_subscription(PoseWithCovarianceStamped, '/lidar_fix', self.on_lidar_fix, 10)
             # gimbal: commands from localization (2 joints) vs joint_state_publisher (all joints, zeros)
             self.create_subscription(JointState, '/ugv/joint_states', self.on_joint_states, qos_profile_sensor_data)
             self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 10)
@@ -346,6 +357,9 @@ class LiveRerun(Node):
         pos, tris, nrm, col = fm.barriers()
         rr.log('field/barriers', rr.Mesh3D(vertex_positions=pos, triangle_indices=tris, vertex_normals=nrm,
                                            vertex_colors=col), static=True)
+        # what the localization matches the lidar against (barrier faces at lidar height + boxes)
+        rr.log('field/lidar_map', rr.LineStrips3D(fm.lidar_map(self.cfg['markers'], self.cfg['lidar_height']),
+                                                  colors=[COLOURS['lidar_map']], radii=0.006), static=True)
 
         # marker boxes: black cube, white paper + black tag flush on the front face
         self.boxes = fm.marker_boxes(self.cfg['markers'], self.cfg['tag_size'])
@@ -424,13 +438,21 @@ class LiveRerun(Node):
         a = msg.angle_min + np.arange(len(r), dtype=np.float32) * msg.angle_increment
         ok = np.isfinite(r) & (r > msg.range_min) & (r < msg.range_max)
         pts = np.stack([r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok]), np.zeros(ok.sum())], axis=1)
-        try:   # LiDAR frame -> base_link (mounting offset and rotation from the rover's TF)
-            tr = self.tf_buffer.lookup_transform(ROBOT_FRAME, msg.header.frame_id, Time())
-            v = tr.transform.translation
-            pts = pts @ quaternion_to_matrix(tr.transform.rotation).T + np.array([v.x, v.y, 0.0])
-        except TransformException:
-            self.get_logger().warning(f'no TF {msg.header.frame_id} -> {ROBOT_FRAME} yet: LiDAR shown unrotated',
-                                      throttle_duration_sec=10.0)
+        # LiDAR frame -> base_link: same mount as localization.py (TF if lidar_use_tf, + config offsets)
+        tx, ty, yaw = 0.0, 0.0, 0.0
+        if self.cfg['lidar_use_tf']:
+            try:
+                tr = self.tf_buffer.lookup_transform(ROBOT_FRAME, msg.header.frame_id, Time())
+                v, q = tr.transform.translation, tr.transform.rotation
+                tx, ty = v.x, v.y
+                yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+            except TransformException:
+                self.get_logger().warning(f'no TF {msg.header.frame_id} -> {ROBOT_FRAME} yet: LiDAR shown '
+                                          'with the config offsets only', throttle_duration_sec=10.0)
+        ox, oy, oyaw = self.cfg['lidar_offset']
+        tx, ty, yaw = tx + ox, ty + oy, yaw + oyaw
+        c, s = math.cos(yaw), math.sin(yaw)
+        pts = pts @ np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]).T + np.array([tx, ty, 0.0])
         self.set_now()
         if 'top' in self.show:
             rr.log('top/lidar', rr.Points3D(pts, colors=[COLOURS['lidar']], radii=0.015))
@@ -518,6 +540,22 @@ class LiveRerun(Node):
         rr.log('field/uncertainty', rr.LineStrips3D([[[x + px, y + py, 0.02] for px, py in pts]],
                                                     colors=[COLOURS['uncertainty']], radii=0.01))
 
+    def on_lidar_fix(self, msg: PoseWithCovarianceStamped):
+        """Pose from the lidar scan alone (localization publishes it before fusing): magenta ghost."""
+        q = msg.pose.pose.orientation
+        heading = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        x, y = msg.pose.pose.position.x, msg.pose.pose.position.y
+        c = msg.pose.covariance
+        self.lidar_fix = (self.now_s(), x, y, heading, int(c[14]), float(c[21]))   # inliers, rms (see localization)
+        self.set_now()
+        rr.log('field/robot_lidar', rr.Transform3D(translation=[x, y, 0.0],
+                                                   rotation=rr.RotationAxisAngle(axis=[0, 0, 1], radians=heading)))
+        if not self.lidar_fix_ghost_on:
+            self.lidar_fix_ghost_on = True
+            log_robot('field/robot_lidar', colour=COLOURS['lidar_fix'])
+        if 'plots' in self.show:
+            self.log_pose_plots('lidar', x, y, heading)
+
     def on_joint_states(self, msg: JointState):
         pos = dict(zip(msg.name, msg.position))
         if 'pt_base_link_to_pt_link1' not in pos:
@@ -590,6 +628,15 @@ class LiveRerun(Node):
                         f'{math.degrees(math.atan2(math.sin(fh - self.pose[3]), math.cos(fh - self.pose[3]))):+.0f}°')
             lines.append(f'**Markers only (cyan):** x {fx:+.2f} · y {fy:+.2f} · {math.degrees(fh):+.0f}° from {n} markers, '
                          f'fit error {fit:.2f} m ({age(ft)}){diff}')
+        # 2b. lidar scan matching
+        if self.lidar_fix is not None:
+            lt, lx, ly, lh, n, rms = self.lidar_fix
+            diff = ''
+            if self.pose is not None and self.pose[4] == 'map':
+                diff = (f'  ·  differs from localization by {math.hypot(lx - self.pose[1], ly - self.pose[2]):.2f} m, '
+                        f'{math.degrees(math.atan2(math.sin(lh - self.pose[3]), math.cos(lh - self.pose[3]))):+.0f}°')
+            lines.append(f'**Lidar match (magenta):** x {lx:+.2f} · y {ly:+.2f} · {math.degrees(lh):+.0f}° '
+                         f'{n} points on the map, rms {rms * 100:.1f} cm ({age(lt)}){diff}')
         # 3. gimbal
         if self.pan_cmd is not None or self.jsp_zero is not None:
             g = []

@@ -14,13 +14,22 @@ Frame = localization's field frame: (0, 0) centre spot, x towards the target goa
 Every function returns plain arrays: positions (N, 3), triangles (M, 3), normals (N, 3).
 """
 import math
+import os
+import sys
 
 import numpy as np
+
+# barriers + marker boxes: shared with the localization (lidar scan matching), one source of truth
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                'src', 'control_localization_pkg'))
+from control_localization_pkg import field_map  # noqa: E402
+from control_localization_pkg.field_map import (  # noqa: E402,F401
+    CARPET_HALF, BARRIER_LENGTH, BARRIER_PROFILE, BARRIER_GAP, GOAL_GAP_HALF, BOX_SIZE, MARKER_NORMALS,
+    barrier_layout)
 
 # line centres (xmin, xmax, ymin, ymax): outer edge of each line = tag face of the boxes beside it
 # (localization.py FIELD_BOUNDS, minus half the 5 cm line). -x end mirrored from +x (no box there).
 FIELD_LINES = (-4.487, 4.487, -2.887, 2.994)
-CARPET_HALF = (5.2, 3.7)         # + 0.7 m border strip
 LINE_W = 0.05
 CIRCLE_R = 0.75
 PENALTY_AREA = (1.65, 2.0)       # depth from the goal line, half width
@@ -28,17 +37,9 @@ GOAL_AREA = (0.6, 1.1)
 PENALTY_MARK_X = FIELD_LINES[1] - 1.3
 SPOT_R = 0.05                    # penalty mark / centre spot: 100 mm
 
-BARRIER_LENGTH = 0.985
-BARRIER_PROFILE = [(-0.275, 0.0), (0.275, 0.0), (0.275, 0.144), (0.082, 0.40), (-0.082, 0.40), (-0.275, 0.144)]
-BARRIER_GAP = 0.035
-GOAL_GAP_HALF = 0.8              # short sides: no barriers within +-0.8 m of the goal (placement guess)
-
-BOX_SIZE = 0.30
 PAPER_SIZE = 0.2084
 DUCK_HEIGHT = 0.04
 
-# marker boxes: direction each tag faces (into the field), per marker id (localization.py)
-MARKER_NORMALS = {0: (-1.0, 0.0), 1: (0.0, 1.0), 2: (0.0, -1.0), 3: (0.0, 1.0), 4: (0.0, -1.0), 5: (-1.0, 0.0)}
 
 
 class MeshBuilder:
@@ -137,24 +138,6 @@ def lines(z=-0.002, colour=(232, 232, 226)):
     return mb.arrays()
 
 
-def barrier_layout():
-    """[(centre x, centre y, along_x)] of the barriers, just outside the carpet, 3.5 cm apart:
-    both long sides full length, the short sides from the corners up to the goal.
-    The placement is a guess from the photos: change it here if the lab is different."""
-    depth = BARRIER_PROFILE[1][0] - BARRIER_PROFILE[0][0]
-    cx, cy = CARPET_HALF
-    step = BARRIER_LENGTH + BARRIER_GAP
-    out = []
-    n = int((2 * cx + BARRIER_GAP) // step)
-    for side in (-1, 1):
-        out += [((i - (n - 1) / 2) * step, side * (cy + depth / 2), True) for i in range(n)]
-    n = int((cy - GOAL_GAP_HALF + BARRIER_GAP) // step)
-    for side in (-1, 1):
-        for sy in (-1, 1):
-            out += [(side * (cx + depth / 2), sy * (cy - BARRIER_LENGTH / 2 - i * step), False) for i in range(n)]
-    return out
-
-
 def barriers(colour=(196, 38, 32), top_colour=(222, 70, 60)):
     """Jersey-barrier prisms (barrier.blend profile) at barrier_layout()."""
     mb = MeshBuilder()
@@ -188,6 +171,12 @@ def marker_boxes(markers, tag_size):
                         paper=[x + nx * 0.0005, y + ny * 0.0005, h],
                         tag=[x + nx * 0.0012, y + ny * 0.0012, h], tag_size=tag_size)
     return out
+
+
+def lidar_map(markers, lidar_height):
+    """Line segments the localization matches the lidar scan against: [[(x, y, z), (x, y, z)], ...]."""
+    segs, _ = field_map.map_segments(markers, lidar_height=lidar_height)
+    return [[[a[0], a[1], lidar_height], [b[0], b[1], lidar_height]] for a, b in segs]
 
 
 def duck(x, y, yaw=math.pi):
