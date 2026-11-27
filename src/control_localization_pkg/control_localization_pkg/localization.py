@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -55,6 +56,12 @@ DEFAULTS = {
     # pan/tilt command topic: the rover's joint_state_publisher must list it in its
     # source_list, otherwise its 10 Hz zeros on /ugv/joint_states override every command
     "camera_cmd_topic": "/ugv/pt_cmd",
+    # Start-up camera sweep: after the gyro calibration the pan-tilt camera visits these pan
+    # angles, collects every marker it sees, and the first anchor is triangulated from all of them
+    "calib_sweep": True,
+    "calib_pan_deg": [-144.0, -72.0, 0.0, 72.0, 144.0],
+    "calib_settle_s": 0.8,    # s; detections ignored after each pan command (servo travel + detector lag)
+    "calib_dwell_s": 1.5,     # s; time spent at each pan angle (settle included)
     "odom_topic": "/odom",
     "imu_topic": "/imu/data_raw",
     "calib_time": 3.0,        # s; gyroscope bias estimation
@@ -193,6 +200,28 @@ MARKER_NORMALS = {
 }
 
 
+def sweep_detections(samples, pose):
+    """Marker sightings collected during the start-up sweep, as detections relative to ``pose``.
+
+    samples: {marker_key: [(x, y), ...]} marker positions in the odom frame, one per frame in which
+    the marker was seen. Storing them in the odom frame keeps them valid if the robot moves during
+    the sweep. The median of each list is turned back into (dist, theta) from ``pose``
+    (the current odom-frame pose), so a triangulation of the result gives the current pose.
+    """
+    x, y, heading = pose
+    detections = []
+    for key, points in sorted(samples.items()):
+        if not points:
+            continue
+        px, py = np.median(np.asarray(points, dtype=float), axis=0)
+        dx, dy = px - x, py - y
+        family, marker_id = key.rsplit(":", 1)
+        detections.append(SimpleNamespace(
+            family=family, id=int(marker_id), dist=float(np.hypot(dx, dy)),
+            theta=float(wrap_angle(np.arctan2(dy, dx) - heading))))
+    return detections
+
+
 def optimal_tilt_camera(pose, markers, current_pan=0.0, max_distance=4.0, fov_deg=120.0, marker_normals=None, min_bearing_sin=0.05):
     """Return a pan command in radians; None means hold the current view.    """
     if pose is None:
@@ -312,6 +341,12 @@ class Localization(Node):
         self.camera_publisher = self.create_publisher(JointState, self.camera_cmd_topic, 10)
         self.camera_last_update = float("-inf")
         self.camera_last_pan = None
+        # start-up sweep state
+        self.sweep_done = not self.calib_sweep or len(self.calib_pan_deg) == 0
+        self.sweep_index = None       # index into calib_pan_deg; None = not started
+        self.sweep_step_start = None
+        self.sweep_samples = {}       # marker key -> [(x, y) in the odom frame]
+        self.sweep_spots = {}         # physical spot -> marker key (both tag families on one box count once)
         self.create_subscription(DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(Imu, self.imu_topic, self._imu_callback, 50)
@@ -355,6 +390,11 @@ class Localization(Node):
                 detections.append(known[key])
 
         if not detections:
+            return
+
+        # Start-up sweep: only collect; the anchor comes from all sightings at the end of the sweep
+        if not self.sweep_done:
+            self._collect_sweep(detections)
             return
 
         # (Re-)anchor by triangulation: before the first fix (pose only in the odom
@@ -644,6 +684,67 @@ class Localization(Node):
                     (self.odom_noise_frac * ds) ** 2, self.pos_process_sigma ** 2 * dt)
         self.odom_stamp = now
 
+    # ---- start-up camera sweep -------------------------------------------------------------
+    def _send_camera(self, pan):
+        command = JointState()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.name = ["pt_base_link_to_pt_link1", "pt_link1_to_pt_link2"]
+        command.position = [
+            float(pan),
+            float(np.clip(np.deg2rad(self.camera_tilt_deg), -0.5233333, 1.5707963)),
+        ]
+        self.camera_publisher.publish(command)
+        self.camera_last_pan = float(pan)
+
+    def _collect_sweep(self, detections):
+        """Store the sightings of this frame in the odom frame, once the camera has settled."""
+        if self.sweep_index is None or self.now_seconds() - self.sweep_step_start < self.calib_settle_s:
+            return
+        x, y, heading = self.state
+        for d in detections:
+            key = self.marker_key(d)
+            key = self.sweep_spots.setdefault(tuple(self.markers[key]), key)
+            angle = heading + d.theta
+            self.sweep_samples.setdefault(key, []).append(
+                (x + d.dist * np.cos(angle), y + d.dist * np.sin(angle)))
+
+    def _sweep_step(self, now):
+        """Turn the camera through calib_pan_deg, then anchor from everything seen."""
+        if self.sweep_done:
+            return
+        if self.sweep_index is None:
+            self.get_logger().info(
+                f"Camera calibration sweep: pan {list(self.calib_pan_deg)} deg, "
+                f"{self.calib_dwell_s:.1f} s each.")
+        elif now - self.sweep_step_start < self.calib_dwell_s:
+            return
+        self.sweep_index = 0 if self.sweep_index is None else self.sweep_index + 1
+        if self.sweep_index < len(self.calib_pan_deg):
+            self._send_camera(np.clip(np.deg2rad(self.calib_pan_deg[self.sweep_index]), -3.14, 3.14))
+            self.sweep_step_start = now
+            return
+        self._finish_sweep()
+
+    def _finish_sweep(self):
+        self.sweep_done = True
+        detections = sweep_detections(self.sweep_samples, self.state)
+        seen = ", ".join(f"{self.marker_key(d)} ({len(self.sweep_samples[self.marker_key(d)])} frames)"
+                         for d in detections) or "none"
+        fix = self._triangulate(detections) if len(detections) >= 2 else None
+        self.camera_last_update = float("-inf")   # let _aim_camera pick a view right away
+        if fix is not None:
+            self._anchor(fix)
+            self.get_logger().info(
+                f"Camera calibration sweep: start pose x={fix[0]:.2f}, y={fix[1]:.2f}, "
+                f"heading={np.degrees(fix[2]):.1f} deg from markers {seen}.")
+        else:
+            self._send_camera(0.0)
+            self.get_logger().warning(
+                f"Camera calibration sweep: no usable marker pair (seen: {seen}); "
+                "falling back to anchoring on the first frame with two markers.")
+        self.sweep_samples.clear()
+        self.sweep_spots.clear()
+
     def _aim_camera(self, now):
         """Sends both joint positions, at most twice per second after a recent fix"""
         if (not self.camera_auto or self.pose is None or self.last_fix is None
@@ -664,19 +765,11 @@ class Localization(Node):
             return
         if (self.camera_last_pan is not None and abs(pan - self.camera_last_pan) < np.deg2rad(5.0)):
             return
-
-        command = JointState()
-        command.header.stamp = self.get_clock().now().to_msg()
-        command.name = ["pt_base_link_to_pt_link1", "pt_link1_to_pt_link2"]
-        command.position = [
-            float(pan),
-            float(np.clip(np.deg2rad(self.camera_tilt_deg), -0.5233333, 1.5707963)),
-        ]
-        self.camera_publisher.publish(command)
-        self.camera_last_pan = pan
+        self._send_camera(pan)
 
     def _tick(self):
         if self.pose is None: return
+        self._sweep_step(self.now_seconds())
 
         now = self.get_clock().now()
         ages = [(now - t).nanoseconds * 1e-9 for t in (self.odom_stamp, self.imu_stamp) if t is not None]
