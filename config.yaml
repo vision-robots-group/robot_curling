@@ -67,8 +67,9 @@ localization:
     camera_cmd_topic: /ugv/pt_cmd # merged into /ugv/joint_states by joint_state_publisher (source_list)
     calib_sweep: true         # start-up pan sweep to find the start pose from every marker around
     calib_pan_deg: [-144.0, -72.0, 0.0, 72.0, 144.0]  # floats only; 72 deg steps < camera_fov_deg = overlap
-    calib_settle_s: 0.8       # s; ignore detections right after each pan command (servo + detector lag)
-    calib_dwell_s: 1.5        # s; time at each pan angle (settle included)
+    calib_settle_s: 0.5       # s; ignore detections right after the camera arrives (servo + detector lag)
+    calib_dwell_s: 1.5        # s; time at each pan angle after arriving (settle included)
+    pan_rate_deg_s: 40.0      # deg/s; pan slews at this rate (slower = sharper frames, no overshoot); <= 0 jumps
     
     odom_topic: /odom
     imu_topic: /imu/data_raw

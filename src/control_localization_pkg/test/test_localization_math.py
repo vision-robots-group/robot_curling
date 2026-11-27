@@ -87,3 +87,20 @@ def test_triangulation_rejects_large_miss(node):
     pose = np.array([1.52, 0.0, 0.0])
     dets = detections_from(node, pose, ["tag36h11:3", "tag36h11:4"], dist_noise=(-1.0, -1.0))
     assert node._triangulate(dets) is None
+
+
+def test_pan_ramp_is_rate_limited(node):
+    node.pan_rate_deg_s = 40.0
+    node.pan_cmd, node.pan_arrived = 0.0, 0.0
+    sent = []
+    node.camera_publisher.publish = lambda msg: sent.append(msg.position[0])
+    node._send_camera(np.deg2rad(72.0))
+    t = node.pan_ramp_time
+    steps = 0
+    while node.pan_arrived == float("inf") and steps < 200:
+        t += 0.05
+        node._ramp_camera(t)
+        steps += 1
+    assert sent[-1] == pytest.approx(np.deg2rad(72.0))
+    assert np.max(np.abs(np.diff([0.0] + sent))) <= np.deg2rad(40.0) * 0.05 + 1e-9
+    assert 1.7 <= t - (node.pan_ramp_time - 0.05 * steps) <= 1.9   # 72 deg / 40 deg/s = 1.8 s

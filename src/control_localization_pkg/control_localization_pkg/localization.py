@@ -54,8 +54,11 @@ DEFAULTS = {
     # angles, collects every marker it sees, and the first anchor is triangulated from all of them
     "calib_sweep": True,
     "calib_pan_deg": [-144.0, -72.0, 0.0, 72.0, 144.0],
-    "calib_settle_s": 0.8,    # s; detections ignored after each pan command (servo travel + detector lag)
-    "calib_dwell_s": 1.5,     # s; time spent at each pan angle (settle included)
+    "calib_settle_s": 0.5,    # s; detections ignored after the camera ARRIVES at a pan angle (detector lag)
+    "calib_dwell_s": 1.5,     # s; time spent at each pan angle after arriving (settle included)
+    # Pan slew rate: commands are ramped in small steps at this rate instead of jumping, so the
+    # servo does not whip/overshoot and frames are sharp when it arrives. <= 0: jump directly.
+    "pan_rate_deg_s": 40.0,
     "odom_topic": "/odom",
     "imu_topic": "/imu/data_raw",
     "calib_time": 3.0,        # s; gyroscope bias estimation
@@ -327,7 +330,12 @@ class Localization(Node):
 
         self.camera_publisher = self.create_publisher(JointState, self.camera_cmd_topic, 10)
         self.camera_last_update = float("-inf")
-        self.camera_last_pan = None
+        self.camera_last_pan = None       # pan TARGET (where the camera is going)
+        self.pan_cmd = 0.0                # pan actually commanded now (ramps towards the target);
+                                          # the servo starts at 0 (joint_state_publisher default)
+        self.pan_arrived = float("-inf")  # time the ramp reached the target; inf while moving
+        self.pan_ramp_time = None
+        self.search_dir = 1
         # start-up sweep state
         self.sweep_done = not self.calib_sweep or len(self.calib_pan_deg) == 0
         self.sweep_index = None       # index into calib_pan_deg; None = not started
@@ -581,7 +589,7 @@ class Localization(Node):
         self.odom_msg_t = t
 
     # ---- start-up camera sweep -------------------------------------------------------------
-    def _send_camera(self, pan):
+    def _publish_camera(self, pan):
         command = JointState()
         command.header.stamp = self.get_clock().now().to_msg()
         command.name = ["pt_base_link_to_pt_link1", "pt_link1_to_pt_link2"]
@@ -590,12 +598,39 @@ class Localization(Node):
             float(np.clip(np.deg2rad(self.camera_tilt_deg), -0.5233333, 1.5707963)),
         ]
         self.camera_publisher.publish(command)
+        self.pan_cmd = float(pan)
+
+    def _send_camera(self, pan):
+        """Set a new pan target; the camera slews there at pan_rate_deg_s (see _ramp_camera)."""
+        now = self.now_seconds()
         self.camera_last_pan = float(pan)
+        if self.pan_cmd is None or self.pan_rate_deg_s <= 0:
+            self._publish_camera(pan)   # first command (position unknown) or ramp disabled
+            self.pan_arrived = now
+            return
+        if abs(pan - self.pan_cmd) > 1e-6:
+            self.pan_arrived = float("inf")
+            self.pan_ramp_time = now
+            self._ramp_camera(now)
+
+    def _ramp_camera(self, now):
+        """Move the commanded pan one step towards the target (called every tick, 20 Hz)."""
+        if self.pan_cmd is None or self.camera_last_pan is None or self.pan_arrived != float("inf"):
+            return
+        dt = min(max(now - self.pan_ramp_time, 0.0), 0.1)
+        self.pan_ramp_time = now
+        error = self.camera_last_pan - self.pan_cmd
+        step = np.deg2rad(self.pan_rate_deg_s) * dt
+        if abs(error) <= step:
+            self._publish_camera(self.camera_last_pan)
+            self.pan_arrived = now
+        elif step > 0:
+            self._publish_camera(self.pan_cmd + np.sign(error) * step)
 
     def _collect_sweep(self, detections):
         """Store the sightings of this frame in the odom frame, once the camera has settled."""
-        if self.sweep_index is None or self.now_seconds() - self.sweep_step_start < self.calib_settle_s:
-            return
+        if self.sweep_index is None or self.now_seconds() - self.pan_arrived < self.calib_settle_s:
+            return   # still slewing (pan_arrived = inf) or just arrived
         x, y, heading = self.state
         for d in detections:
             key = self.marker_key(d)
@@ -611,9 +646,9 @@ class Localization(Node):
         if self.sweep_index is None:
             self.get_logger().info(
                 f"Camera calibration sweep: pan {list(self.calib_pan_deg)} deg, "
-                f"{self.calib_dwell_s:.1f} s each.")
-        elif now - self.sweep_step_start < self.calib_dwell_s:
-            return
+                f"{self.calib_dwell_s:.1f} s each, slewing at {self.pan_rate_deg_s:.0f} deg/s.")
+        elif now < self.pan_arrived + self.calib_dwell_s:
+            return   # still slewing, or dwelling at the current angle
         self.sweep_index = 0 if self.sweep_index is None else self.sweep_index + 1
         if self.sweep_index < len(self.calib_pan_deg):
             self._send_camera(np.clip(np.deg2rad(self.calib_pan_deg[self.sweep_index]), -3.14, 3.14))
@@ -655,10 +690,13 @@ class Localization(Node):
             self.search_index = 0
             self.get_logger().info(
                 f"No marker accepted for {self.search_after_s:.1f} s: pan-tilt search {pans} deg.")
-        elif now - self.search_step_start < self.calib_dwell_s:
+        elif now < self.pan_arrived + self.calib_dwell_s:
             return
-        else:
-            self.search_index = (self.search_index + 1) % len(pans)
+        elif len(pans) > 1:
+            # back and forth (0..n-1..0) instead of wrapping: no long slew from one end to the other
+            if not 0 <= self.search_index + self.search_dir < len(pans):
+                self.search_dir = -self.search_dir
+            self.search_index += self.search_dir
         self._send_camera(np.clip(np.deg2rad(pans[self.search_index]), -3.14, 3.14))
         self.search_step_start = now
         self.camera_last_update = now
@@ -701,6 +739,7 @@ class Localization(Node):
 
     def _tick(self):
         if self.pose is None: return
+        self._ramp_camera(self.now_seconds())
         self._sweep_step(self.now_seconds())
 
         now = self.get_clock().now()
