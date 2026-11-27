@@ -94,11 +94,11 @@ POSE_STALE_S = 1.0           # the robot turns grey when /field_pose is older th
 
 # Same values as localization.py / obstacle_avoidance utils.py
 TARGETS = {
-    'penalty_mark': (3.20, 0.00),
-    'goal_corner_right': (3.90, 1.10),
-    'goal_corner_left': (3.90, -1.10),
-    'penalty_corner_right': (2.85, 2.00),
-    'penalty_corner_left': (2.85, -2.00),
+    'penalty_mark': (3.168, 0.000),
+    'goal_corner_right': (3.880, 1.100),
+    'goal_corner_left': (3.880, -1.080),
+    'penalty_corner_right': (2.838, 1.980),
+    'penalty_corner_left': (2.858, -1.963),
 }
 
 # The robot: drawn the same in the top view and on the field

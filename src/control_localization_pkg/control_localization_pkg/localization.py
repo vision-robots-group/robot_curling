@@ -17,19 +17,19 @@ DEFAULTS = {
     # The lines of the field are 5cm large. We may need to remove 2.5cm from some of the measurements.
 
     "marker_map": json.dumps({
-      "tag36h11:0": [-0.725,  0.000],
-      "tag36h11:1": [-1.495, -3.000],
-      "tag36h11:2": [-1.475,  3.000],
-      "tag36h11:3": [ 1.560, -3.000],
-      "tag36h11:4": [ 1.545,  3.000],
-      "tag36h11:5": [ 4.500,  0.000],
+      "tag36h11:0": [-0.601,  0.000],
+      "tag36h11:1": [-1.529, -3.062],
+      "tag36h11:2": [-1.514,  3.169],
+      "tag36h11:3": [ 1.528, -3.062],
+      "tag36h11:4": [ 1.514,  3.169],
+      "tag36h11:5": [ 4.662,  0.000],
 
-      "tagStandard41h12:0": [-0.725,  0.000],
-      "tagStandard41h12:1": [-1.495, -3.000],
-      "tagStandard41h12:2": [-1.475,  3.000],
-      "tagStandard41h12:3": [ 1.560, -3.000],
-      "tagStandard41h12:4": [ 1.545,  3.000],
-      "tagStandard41h12:5": [ 4.500,  0.000]
+      "tagStandard41h12:0": [-0.601,  0.000],
+      "tagStandard41h12:1": [-1.529, -3.062],
+      "tagStandard41h12:2": [-1.514,  3.169],
+      "tagStandard41h12:3": [ 1.528, -3.062],
+      "tagStandard41h12:4": [ 1.514,  3.169],
+      "tagStandard41h12:5": [ 4.662,  0.000]
     }),
     "min_bearing_sin": 0.05,
     "distance_sigma_m": 0.15,
@@ -59,11 +59,11 @@ DEFAULTS = {
 FIELD_BOUNDS = (-4.5, 4.5, -3.0, 3.0) # in meters; (0,0) is field center
 
 TARGETS = {
-    "penalty_mark": (3.20, 0.00),
-    "goal_corner_right": (3.90, 1.10),
-    "goal_corner_left": (3.90, -1.10),
-    "penalty_corner_right": (2.85, 2.00),
-    "penalty_corner_left": (2.85, -2.00),
+    "penalty_mark": (3.168, 0.000),
+    "goal_corner_right": (3.880, 1.100),
+    "goal_corner_left": (3.880, -1.080),
+    "penalty_corner_right": (2.838, 1.980),
+    "penalty_corner_left": (2.858, -1.963),
 }
 
 def wrap_angle(angle):
