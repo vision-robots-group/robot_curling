@@ -83,7 +83,7 @@ localization:
     lidar_yaw_offset_deg: 0.0
     lidar_x_offset_m: 0.0
     lidar_y_offset_m: 0.0
-    lidar_height_m: 0.20      # MEASURE: beam height above the floor (barrier faces slope in above 0.144 m)
+    lidar_height_m: 0.165     # measured: beam height above the floor (barrier faces slope in above 0.144 m)
     lidar_min_range: 0.15     # m
     lidar_max_range: 6.0      # m
     lidar_min_inliers: 40     # points within 10 cm of the map to accept a match
