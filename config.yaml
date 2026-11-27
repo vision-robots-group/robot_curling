@@ -5,8 +5,12 @@ marker_detector:
     preprocessing: true    # tuned AprilTag detector settings (see __detector)
     bb_show: true          # true: publish /marker_bb_image with bounding boxes
     bb_colour: true        # true: boxes on the colour image; false: grey
-    use_compressed: true   # true: read <image topic>/compressed (much faster over Wi-Fi)
+    use_compressed: false  # pan-tilt: raw /image_rect (no JPEG artefacts on small/far tags; more Wi-Fi)
     use_tf: true           # true: camera -> base_link from TF; false: hand-written pan-tilt geometry
+    detections_topic: /detected_markers_pt   # localization reads the per-camera topics
+    motion_gate: true      # drop pan-tilt frames while the servo may still be moving
+    settle_s: 0.25         # s; fixed settle + latency after a pan/tilt command
+    servo_speed_rad_s: 3.0 # rad/s; |step| / speed is added to settle_s
 
 # Only used by launch/two_cameras.launch.py (both cameras + fusion)
 marker_detector_oak:
@@ -33,6 +37,9 @@ marker_fusion:
 
 localization:
   ros__parameters:
+    detection_topics: [/detected_markers_pt, /detected_markers_oak]  # per camera, each frame used once
+    latency_buffer_s: 1.0   # s; odometry history to move a detection to its capture time
+    search_after_s: 2.0     # s; no accepted marker this long -> pan-tilt search pattern
     marker_map: >
       {
       "tag36h11:0": [-0.751,  0.000],

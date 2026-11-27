@@ -6,6 +6,10 @@ OAK-D -> ``/detected_markers_oak``). This node keeps the latest list of every ca
 publishes one merged ``DetectionArray`` on ``/detected_markers`` (same message as before,
 so the code that uses ``/detected_markers`` does not change).
 
+NOTE: localization does NOT use this topic any more. It reads the per-camera topics so that
+every measurement enters the EKF exactly once (this node re-publishes a camera's last list
+whenever the other camera sends one). The fused topic is kept for tools / visualization.
+
 Per marker (family + id):
 - seen by one camera: used as it is;
 - seen by several cameras: weighted average of the positions (x, y in base_link), with
@@ -71,6 +75,10 @@ class MarkerFusion(Node):
                 per_marker.setdefault((d.family, d.id), []).append((topic, x, y, w))
 
         fused = DetectionArray()
+        fresh = [msg for stamp, msg in self.latest.values() if now - stamp <= self.max_age_s]
+        if fresh:   # newest capture time of the merged lists
+            newest = max(fresh, key=lambda m: (m.header.stamp.sec, m.header.stamp.nanosec))
+            fused.header = newest.header
         for (family, marker_id), views in sorted(per_marker.items(), key=lambda kv: (kv[0][1], kv[0][0])):
             total = sum(w for _, _, _, w in views)
             if total <= 0:

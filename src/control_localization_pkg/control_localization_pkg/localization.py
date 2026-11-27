@@ -7,6 +7,7 @@ from robot_interfaces.msg import DetectionArray
 import numpy as np
 from typing import Optional, Tuple
 from itertools import combinations
+from collections import deque
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
@@ -33,6 +34,11 @@ DEFAULTS = {
       "tagStandard41h12:4": [ 1.514,  3.019],
       "tagStandard41h12:5": [ 4.512,  0.000]
     }),
+    # One topic per camera (NOT the fused /detected_markers: marker_fusion re-publishes a camera's
+    # last list each time the other camera sends one, so the EKF would use one measurement 2-3x)
+    "detection_topics": ["/detected_markers_pt", "/detected_markers_oak"],
+    "latency_buffer_s": 1.0,      # s; odometry history used to move a detection to the present
+    "search_after_s": 2.0,        # s; no accepted marker for this long -> pan-tilt search pattern
     "min_bearing_sin": 0.05,
     "distance_sigma_m": 0.15,
     "bearing_sigma_rad": 0.10,
@@ -82,6 +88,33 @@ TARGETS = {
 
 def wrap_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
+
+
+def stamp_seconds(stamp):
+    """builtin_interfaces/Time -> float seconds (0.0 if unset)."""
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def compensate_detection(dist, theta, pose_then, pose_now):
+    """Re-express a (dist, theta) measured at pose_then as seen from pose_now.
+
+    Only the relative motion between the two poses matters, so both may be in any common frame
+    (e.g. pure odometry). Removes the error of applying a delayed image to the current pose.
+    """
+    xt, yt, ht = pose_then
+    xn, yn, hn = pose_now
+    px = xt + dist * np.cos(ht + theta)
+    py = yt + dist * np.sin(ht + theta)
+    dx, dy = px - xn, py - yn
+    return float(np.hypot(dx, dy)), float(wrap_angle(np.arctan2(dy, dx) - hn))
+
+
+def odom_pose_at(history, t):
+    """Pose in ``history`` (deque of (time, pose), time ascending) closest to time t, or None."""
+    # imu and odom stamps interleave, so allow a little slack at both ends
+    if not history or t < history[0][0] - 0.02 or t > history[-1][0] + 0.02:
+        return None
+    return min(history, key=lambda item: abs(item[0] - t))[1]
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +221,7 @@ def sweep_detections(samples, pose):
     return detections
 
 
-def optimal_tilt_camera(pose, markers, current_pan=0.0, max_distance=4.0, fov_deg=120.0, marker_normals=None, min_bearing_sin=0.05):
+def optimal_pan_camera(pose, markers, current_pan=0.0, max_distance=4.0, fov_deg=120.0, marker_normals=None, min_bearing_sin=0.05):
     """Return a pan command in radians; None means hold the current view.    """
     if pose is None:
         return None
@@ -278,8 +311,16 @@ class Localization(Node):
         self.last_fix = None
         self.rejects = 0
 
-        self.odom_stamp = None
+        self.odom_stamp = None    # receive times (staleness check)
         self.imu_stamp = None
+        self.odom_msg_t = None    # sensor stamps in s (integration dt)
+        self.imu_msg_t = None
+        # Pure dead reckoning (never corrected by markers) and its recent history, keyed by sensor
+        # stamp: gives the robot's motion between an image's capture time and now.
+        self.odo = np.zeros(3)
+        self.odo_history = deque()
+        self.search_index = None       # pan-tilt search pattern (index into calib_pan_deg)
+        self.search_step_start = None
         self.calib_start = None
         self.gyro = []
         self.bias = None
@@ -293,7 +334,8 @@ class Localization(Node):
         self.sweep_step_start = None
         self.sweep_samples = {}       # marker key -> [(x, y) in the odom frame]
         self.sweep_spots = {}         # physical spot -> marker key (both tag families on one box count once)
-        self.create_subscription(DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
+        for topic in self.detection_topics:
+            self.create_subscription(DetectionArray, topic, self._marker_detection_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(Imu, self.imu_topic, self._imu_callback, 50)
         self.pose_publisher = self.create_publisher(PoseStamped, "/field_pose", 10)
@@ -323,11 +365,22 @@ class Localization(Node):
 
         # unknown markers are discarded; the same physical spot (e.g. both tag
         # families mapped to one post) is used once, so it is not counted twice
+        # latency: move every detection from the image's capture time to the present
+        motion = None
+        t_image = stamp_seconds(msg.header.stamp)
+        if t_image > 0 and self.odo_history:
+            then = odom_pose_at(self.odo_history, t_image)
+            if then is not None:
+                motion = (then, self.odo_history[-1][1])
+
         known = {}
         for d in msg.detections:
             key = self.marker_key(d)
             if (key in self.markers and np.isfinite(d.dist) and np.isfinite(d.theta) and d.dist > 0):
-                known.setdefault(key, d)
+                dist, theta = d.dist, d.theta
+                if motion is not None:
+                    dist, theta = compensate_detection(dist, theta, *motion)
+                known.setdefault(key, SimpleNamespace(family=d.family, id=d.id, dist=dist, theta=theta))
         detections, spots = [], set()
         for key in sorted(known):
             spot = tuple(self.markers[key])
@@ -414,8 +467,12 @@ class Localization(Node):
 
         d1, d2 = first.dist, second.dist
 
-        # Circles must intersect
-        if ( tag_dist <= 0 or tag_dist > d1 + d2 or tag_dist < abs(d1 - d2) ):
+        # Circles must intersect; a miss within the distance noise is clamped (robot on the
+        # marker baseline line) instead of throwing the pair away
+        if tag_dist <= 0:
+            return None
+        miss = max(tag_dist - (d1 + d2), abs(d1 - d2) - tag_dist)
+        if miss > 3 * self.distance_sigma_m:
             return None
 
         x = (d1**2 - d2**2 + tag_dist**2) / (2 * tag_dist)
@@ -427,7 +484,9 @@ class Localization(Node):
         first, second = detections
         side = np.sin(second.theta - first.theta)
 
-        if abs(side) < self.min_bearing_sin:
+        # collinear bearings are only acceptable when the robot really is on the baseline line
+        # (then the mirror side does not matter)
+        if abs(side) < self.min_bearing_sin and y_abs > 0.05:
             return None
 
         y = np.sign(side) * y_abs
@@ -468,9 +527,20 @@ class Localization(Node):
 
         return score
 
+    def _sensor_time(self, msg, now):
+        """Sensor stamp in s; receive time if the driver leaves it empty."""
+        t = stamp_seconds(msg.header.stamp)
+        return t if t > 0 else now.nanoseconds * 1e-9
+
+    def _remember_odo(self, t):
+        self.odo_history.append((t, self.odo.copy()))
+        while self.odo_history and self.odo_history[0][0] < t - self.latency_buffer_s:
+            self.odo_history.popleft()
+
     def _imu_callback(self, msg):
         """Gyro: calibrate the bias while standing still, then integrate the heading."""
         now = self.get_clock().now()
+        t = self._sensor_time(msg, now)
         gz = msg.angular_velocity.z
 
         if self.bias is None:
@@ -482,25 +552,33 @@ class Localization(Node):
                 self.state = np.zeros(3)
                 self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, self.init_heading_sigma ** 2])
                 self.get_logger().info(f"Gyro bias {self.bias:.5f} rad/s, odometry started.")
-        elif self.imu_stamp is not None and self.state is not None:
-            # EKF predict (rotation part)
-            dt = (now - self.imu_stamp).nanoseconds * 1e-9
-            if dt > 0:
+        elif self.imu_msg_t is not None and self.state is not None:
+            # EKF predict (rotation part); dt from the sensor stamps, not from arrival jitter
+            dt = t - self.imu_msg_t
+            if 0 < dt < 0.5:
+                dtheta = (gz - self.bias) * dt
                 self.state, self.P = ekf_predict_rotation(
-                    self.state, self.P, (gz - self.bias) * dt, self.gyro_noise_sigma ** 2 * dt)
+                    self.state, self.P, dtheta, self.gyro_noise_sigma ** 2 * dt)
+                self.odo[2] = wrap_angle(self.odo[2] + dtheta)
+                self._remember_odo(t)
         self.imu_stamp = now
+        self.imu_msg_t = t
 
     def _odom_callback(self, msg):
         """EKF predict (translation part): wheel speed integrated along the current heading."""
         now = self.get_clock().now()
-        if self.state is not None and self.odom_stamp is not None:
-            dt = (now - self.odom_stamp).nanoseconds * 1e-9
-            if dt > 0:
+        t = self._sensor_time(msg, now)
+        if self.state is not None and self.odom_msg_t is not None:
+            dt = t - self.odom_msg_t
+            if 0 < dt < 0.5:
                 ds = msg.twist.twist.linear.x * dt
                 self.state, self.P = ekf_predict_translation(
                     self.state, self.P, ds,
                     (self.odom_noise_frac * ds) ** 2, self.pos_process_sigma ** 2 * dt)
+                self.odo[:2] += ds * np.array([np.cos(self.odo[2]), np.sin(self.odo[2])])
+                self._remember_odo(t)
         self.odom_stamp = now
+        self.odom_msg_t = t
 
     # ---- start-up camera sweep -------------------------------------------------------------
     def _send_camera(self, pan):
@@ -559,20 +637,56 @@ class Localization(Node):
             self._send_camera(0.0)
             self.get_logger().warning(
                 f"Camera calibration sweep: no usable marker pair (seen: {seen}); "
-                "falling back to anchoring on the first frame with two markers.")
+                "sweeping again.")
         self.sweep_samples.clear()
         self.sweep_spots.clear()
 
+    def _restart_sweep(self):
+        self.sweep_done = False
+        self.sweep_index = None
+        self.sweep_samples.clear()
+        self.sweep_spots.clear()
+
+    def _search_step(self, now):
+        """Anchored but no accepted marker for a while: step the camera through calib_pan_deg
+        (detections keep going to the EKF) until a marker is accepted again."""
+        pans = list(self.calib_pan_deg) or [-90.0, 0.0, 90.0]
+        if self.search_index is None:
+            self.search_index = 0
+            self.get_logger().info(
+                f"No marker accepted for {self.search_after_s:.1f} s: pan-tilt search {pans} deg.")
+        elif now - self.search_step_start < self.calib_dwell_s:
+            return
+        else:
+            self.search_index = (self.search_index + 1) % len(pans)
+        self._send_camera(np.clip(np.deg2rad(pans[self.search_index]), -3.14, 3.14))
+        self.search_step_start = now
+        self.camera_last_update = now
+
     def _aim_camera(self, now):
-        """Sends both joint positions, at most twice per second after a recent fix"""
-        if (not self.camera_auto or self.pose is None or self.last_fix is None
-                or now - self.last_fix > 2.0
-                or now - self.camera_last_update < 0.5):
+        """Point the pan-tilt camera: start-up sweep / search when lost, else the best view
+        (at most twice per second)."""
+        if self.pose is None or not self.sweep_done:
+            return
+        # Not anchored after the start-up sweep (e.g. it failed): sweep again until a fix.
+        # Before, the camera stayed at pan 0 forever and the robot could never anchor.
+        if not self.anchored and self.calib_sweep and len(self.calib_pan_deg):
+            self._restart_sweep()
+            return
+        if not self.camera_auto:
+            return
+        if not self.anchored or self.last_fix is None or now - self.last_fix > self.search_after_s:
+            self._search_step(now)   # before: the camera froze exactly when it had to look around
+            return
+        if self.search_index is not None:
+            self.search_index = None
+            self.camera_last_update = float("-inf")
+        if now - self.camera_last_update < 0.5:
             return
         self.camera_last_update = now
         current_pan = self.camera_last_pan if self.camera_last_pan is not None else 0.0
         
-        pan = optimal_tilt_camera(
+        pan = optimal_pan_camera(
             self.pose, self.markers, current_pan=current_pan,
             max_distance=self.camera_max_distance_m,
             fov_deg=self.camera_fov_deg, marker_normals=MARKER_NORMALS,

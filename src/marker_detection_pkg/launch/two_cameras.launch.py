@@ -5,6 +5,9 @@ Marker detection with BOTH cameras: one detector per camera + fusion.
                                                                     +--> marker_fusion -> /detected_markers
   OAK-D RGB       -> marker_detector_oak -> /detected_markers_oak --+
 
+localization subscribes the per-camera topics directly (each frame enters the EKF once);
+/detected_markers (fused) is for tools / visualization only.
+
 Images with boxes: /marker_bb_image (pan-tilt) and /marker_bb_image_oak (OAK).
 
 Run (robot_mode, after `cb`), with on the rover camera.launch.py AND oak_d_lite.launch.py:

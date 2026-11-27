@@ -51,9 +51,16 @@ DEFAULTS = {
     # Camera -> robot conversion
     "use_tf": True,             # true: TF (any camera); false: hand-written pan-tilt geometry
     "robot_frame": "base_link",
+    # Pan-tilt motion gate. /ugv/joint_states holds the COMMANDED pan/tilt (joint_state_publisher
+    # merges /ugv/pt_cmd), so TF already shows the target while the servo is still moving.
+    # Frames of the pan-tilt camera received before the servo can have arrived are dropped.
+    "motion_gate": True,
+    "settle_s": 0.25,           # s; fixed part (servo settling + image/Wi-Fi latency)
+    "servo_speed_rad_s": 3.0,   # rad/s; travel time = |step| / speed is added to settle_s
 }
 
 PAN_TILT_FRAME = "pt_camera_link"   # frame_id of the pan-tilt camera images
+PAN_TILT_JOINTS = ("pt_base_link_to_pt_link1", "pt_link1_to_pt_link2")
 
 
 def quaternion_to_matrix(q) -> np.ndarray:
@@ -64,6 +71,19 @@ def quaternion_to_matrix(q) -> np.ndarray:
         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ])
+
+
+def raw_image_to_bgr(msg):
+    """sensor_msgs/Image -> BGR array with numpy only (cv_bridge breaks under NumPy 2).
+    Returns None for encodings not handled here."""
+    channels = {"bgr8": 3, "rgb8": 3, "mono8": 1, "bgra8": 4, "rgba8": 4}.get(msg.encoding)
+    if channels is None:
+        return None
+    data = np.frombuffer(msg.data, dtype=np.uint8)
+    img = data.reshape(msg.height, msg.step)[:, :msg.width * channels].reshape(msg.height, msg.width, channels)
+    conversion = {"rgb8": cv2.COLOR_RGB2BGR, "mono8": cv2.COLOR_GRAY2BGR,
+                  "bgra8": cv2.COLOR_BGRA2BGR, "rgba8": cv2.COLOR_RGBA2BGR}.get(msg.encoding)
+    return cv2.cvtColor(img, conversion) if conversion is not None else img.copy()
 
 
 class MarkerDetector(Node):
@@ -99,8 +119,17 @@ class MarkerDetector(Node):
                 self.dist_coeffs = np.array(msg.d)
                 self.rectification = np.eye(3)
 
+        self.motion_until = float("-inf")   # node time (s) until which pan-tilt frames are dropped
+
         def update_joint_positions(msg):
+            step = 0.0
+            for name, position in zip(msg.name, msg.position):
+                if name in PAN_TILT_JOINTS and name in self.joint_positions:
+                    step = max(step, abs(position - self.joint_positions[name]))
             self.joint_positions.update(zip(msg.name, msg.position))
+            if step > 1e-3:   # a new pan/tilt command: wait until the servo can be there
+                self.motion_until = max(self.motion_until,
+                                        self.now_s() + self.settle_s + step / self.servo_speed_rad_s)
 
         self.camera_info_subscription = self.create_subscription( CameraInfo, self.camera_info_topic, update_camera_info, qos_profile_sensor_data)
         self.joint_subscription = self.create_subscription( JointState, "/ugv/joint_states", update_joint_positions, qos_profile_sensor_data)
@@ -129,6 +158,9 @@ class MarkerDetector(Node):
         self.detections: DetectionArray = None
         self.undistort_maps = None   # cached maps for calibration=false (computed once, not every frame)
         self.april = self.__detector()
+
+    def now_s(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def __load_config(self):
         """
@@ -201,6 +233,9 @@ class MarkerDetector(Node):
         ``header`` (of the image) is needed for TF: frame_id and time.
         """
         detection_array = DetectionArray()
+        if header is not None:
+            detection_array.header.stamp = header.stamp   # capture time of the image
+        detection_array.header.frame_id = self.robot_frame
 
         K = self.camera_matrix
         have_calibration = ( K is not None and K[0, 0] > 0 and K[1, 1] > 0 )
@@ -293,12 +328,22 @@ class MarkerDetector(Node):
             colour, gray = self.__preprocessing(msg)
             if gray is not None:
                 self.detections = self.detect(gray_image=gray, header=msg.header)
+                if self.__camera_moving(msg.header):
+                    # bearings would use the commanded pan, not where the camera really looked
+                    self.detections.detections = []
                 self.publisher_.publish(self.detections) # publishing right after detections
                 if self.bb_show:
                     self.publisher_bb_image(msg.header, colour)
         except Exception:   # one bad frame must not kill the detector: log it and go on
             self.get_logger().error(f"frame skipped after an error:\n{traceback.format_exc()}",
                                     throttle_duration_sec=5.0)
+
+    def __camera_moving(self, header) -> bool:
+        """True for a pan-tilt frame received while the servo may still be moving."""
+        if not self.motion_gate or self.now_s() >= self.motion_until:
+            return False
+        frame = header.frame_id if header is not None else ""
+        return frame in ("", PAN_TILT_FRAME)
 
     def publisher_bb_image(self, header, colour) -> None:
         """Draw tag bounding boxes, ID, distance and angle; publish on bb_image_topic (/marker_bb_image)."""
@@ -348,7 +393,9 @@ class MarkerDetector(Node):
             if self.use_compressed:
                 colour = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
             else:
-                colour = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                colour = raw_image_to_bgr(msg)
+                if colour is None:   # unusual encoding: let cv_bridge handle it
+                    colour = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except (CvBridgeError, cv2.error) as e:
             self.get_logger().error(f"Image decode error: {e}")
             return None, None
