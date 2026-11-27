@@ -17,13 +17,15 @@ import math
 
 import numpy as np
 
-FIELD_HALF = (4.5, 3.0)          # line centres
+# line centres (xmin, xmax, ymin, ymax): outer edge of each line = tag face of the boxes beside it
+# (localization.py FIELD_BOUNDS, minus half the 5 cm line). -x end mirrored from +x (no box there).
+FIELD_LINES = (-4.487, 4.487, -2.887, 2.994)
 CARPET_HALF = (5.2, 3.7)         # + 0.7 m border strip
 LINE_W = 0.05
 CIRCLE_R = 0.75
 PENALTY_AREA = (1.65, 2.0)       # depth from the goal line, half width
 GOAL_AREA = (0.6, 1.1)
-PENALTY_MARK_X = 4.5 - 1.3       # 3.20 m
+PENALTY_MARK_X = FIELD_LINES[1] - 1.3
 SPOT_R = 0.05                    # penalty mark / centre spot: 100 mm
 
 BARRIER_LENGTH = 0.985
@@ -122,13 +124,13 @@ def lines(z=-0.002, colour=(232, 232, 226)):
         a = np.linspace(0, 2 * math.pi, n, endpoint=False)
         mb.polygon([[x + SPOT_R * math.cos(t), y + SPOT_R * math.sin(t), z] for t in a], colour, up)
 
-    hx, hy = FIELD_HALF
-    rect(-hx, -hy, hx, hy)
-    segment((0, -hy), (0, hy))
+    x0, x1, y0, y1 = FIELD_LINES
+    rect(x0, y0, x1, y1)
+    segment((0, y0), (0, y1))
     ring(CIRCLE_R)
     spot(0, 0)
     for side in (-1, 1):
-        gx = side * hx
+        gx = FIELD_LINES[1] if side > 0 else FIELD_LINES[0]
         rect(gx, -PENALTY_AREA[1], gx - side * PENALTY_AREA[0], PENALTY_AREA[1])
         rect(gx, -GOAL_AREA[1], gx - side * GOAL_AREA[0], GOAL_AREA[1])
         spot(side * PENALTY_MARK_X, 0)
@@ -233,7 +235,8 @@ def goals():
         cyl['rotations'].append((axis / np.linalg.norm(axis), ang))
 
     for s in (-1, 1):
-        gx, bx = s * FIELD_HALF[0], s * (FIELD_HALF[0] + d)
+        gx = FIELD_LINES[1] if s > 0 else FIELD_LINES[0]
+        bx = gx + s * d
         for sy in (-1, 1):
             bar((gx, sy * yp, 0), (gx, sy * yp, h), GOAL_POST_R)                 # front posts
             bar((bx, sy * yp, 0), (bx, sy * yp, h), 0.015)                       # back posts

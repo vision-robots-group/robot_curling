@@ -14,22 +14,23 @@ from sensor_msgs.msg import Imu
 
 DEFAULTS = {
 
-    # The lines of the field are 5cm large. We may need to remove 2.5cm from some of the measurements.
+    # Tag positions (front face of each box). Measured at the box centres, then moved 0.15 m
+    # (half the 0.30 m box) towards the field.
 
     "marker_map": json.dumps({
-      "tag36h11:0": [-0.601,  0.000],
-      "tag36h11:1": [-1.529, -3.062],
-      "tag36h11:2": [-1.514,  3.169],
-      "tag36h11:3": [ 1.528, -3.062],
-      "tag36h11:4": [ 1.514,  3.169],
-      "tag36h11:5": [ 4.662,  0.000],
+      "tag36h11:0": [-0.751,  0.000],
+      "tag36h11:1": [-1.529, -2.912],
+      "tag36h11:2": [-1.514,  3.019],
+      "tag36h11:3": [ 1.528, -2.912],
+      "tag36h11:4": [ 1.514,  3.019],
+      "tag36h11:5": [ 4.512,  0.000],
 
-      "tagStandard41h12:0": [-0.601,  0.000],
-      "tagStandard41h12:1": [-1.529, -3.062],
-      "tagStandard41h12:2": [-1.514,  3.169],
-      "tagStandard41h12:3": [ 1.528, -3.062],
-      "tagStandard41h12:4": [ 1.514,  3.169],
-      "tagStandard41h12:5": [ 4.662,  0.000]
+      "tagStandard41h12:0": [-0.751,  0.000],
+      "tagStandard41h12:1": [-1.529, -2.912],
+      "tagStandard41h12:2": [-1.514,  3.019],
+      "tagStandard41h12:3": [ 1.528, -2.912],
+      "tagStandard41h12:4": [ 1.514,  3.019],
+      "tagStandard41h12:5": [ 4.512,  0.000]
     }),
     "min_bearing_sin": 0.05,
     "distance_sigma_m": 0.15,
@@ -56,7 +57,10 @@ DEFAULTS = {
 }
 
 
-FIELD_BOUNDS = (-4.5, 4.5, -3.0, 3.0) # in meters; (0,0) is field center
+# Outer edges of the field lines, in meters; (0,0) is field center. The side boxes (ids 1-4) and
+# the goal box (id 5) stand just outside the field: their tag face touches the outer edge of the line.
+# No box on the -x end: mirrored from +x.
+FIELD_BOUNDS = (-4.512, 4.512, -2.912, 3.019)
 
 TARGETS = {
     "penalty_mark": (3.168, 0.000),

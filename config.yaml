@@ -35,19 +35,19 @@ localization:
   ros__parameters:
     marker_map: >
       {
-      "tag36h11:0": [-0.601,  0.000],
-      "tag36h11:1": [-1.529, -3.062],
-      "tag36h11:2": [-1.514,  3.169],
-      "tag36h11:3": [ 1.528, -3.062],
-      "tag36h11:4": [ 1.514,  3.169],
-      "tag36h11:5": [ 4.662,  0.000],
+      "tag36h11:0": [-0.751,  0.000],
+      "tag36h11:1": [-1.529, -2.912],
+      "tag36h11:2": [-1.514,  3.019],
+      "tag36h11:3": [ 1.528, -2.912],
+      "tag36h11:4": [ 1.514,  3.019],
+      "tag36h11:5": [ 4.512,  0.000],
 
-      "tagStandard41h12:0": [-0.601,  0.000],
-      "tagStandard41h12:1": [-1.529, -3.062],
-      "tagStandard41h12:2": [-1.514,  3.169],
-      "tagStandard41h12:3": [ 1.528, -3.062],
-      "tagStandard41h12:4": [ 1.514,  3.169],
-      "tagStandard41h12:5": [ 4.662,  0.000]
+      "tagStandard41h12:0": [-0.751,  0.000],
+      "tagStandard41h12:1": [-1.529, -2.912],
+      "tagStandard41h12:2": [-1.514,  3.019],
+      "tagStandard41h12:3": [ 1.528, -2.912],
+      "tagStandard41h12:4": [ 1.514,  3.019],
+      "tagStandard41h12:5": [ 4.512,  0.000]
       }
     min_bearing_sin: 0.05   # [0, 1]; reject nearly collinear bearing geometry
     distance_sigma_m: 0.15  # > 0; expected distance error, metres
