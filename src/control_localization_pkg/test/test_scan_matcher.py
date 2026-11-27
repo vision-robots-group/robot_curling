@@ -95,3 +95,10 @@ def test_barrier_face_height():
     assert fmap.barrier_face_half(0.1) == pytest.approx(0.275)
     assert fmap.barrier_face_half(0.40) == pytest.approx(0.082)
     assert fmap.barrier_face_half(0.5) is None
+
+
+def test_measured_barriers_replace_guess():
+    segs = fmap.parse_barriers('[[[0,3.2],[2,3.3]],[[4.85,1],[4.85,2]]]')
+    out, labels = fmap.map_segments(MARKERS, lidar_height=0.165, barriers=segs)
+    assert labels[:2] == ['barrier_0', 'barrier_1'] and len(out) == 2 + 4 * len(MARKERS)
+    assert fmap.parse_barriers('') is None

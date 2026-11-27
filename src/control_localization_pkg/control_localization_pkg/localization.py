@@ -79,6 +79,7 @@ DEFAULTS = {
     "max_rejects": 5,             # consecutive frames with every marker gated out -> re-anchor by triangulation
     # Lidar scan matching against the static map (red barriers + marker boxes, field_map.py)
     "lidar_enabled": True,
+    "barrier_segments": "",       # measured barrier faces, JSON (tools/map_barriers.py); "" = guessed layout
     "scan_topic": "/scan",
     "robot_frame": "base_link",
     "lidar_rate_hz": 5.0,         # scan matches per second
@@ -326,8 +327,13 @@ class Localization(Node):
         self.lidar_tf_wait = None
         self.lidar_rejects = 0
         self.lidar_gated = 0
+        barriers = field_map.parse_barriers(self.barrier_segments)
         self.segments, _ = field_map.map_segments(
-            field_map.markers_by_id(json.loads(self.marker_map)), lidar_height=self.lidar_height_m)
+            field_map.markers_by_id(json.loads(self.marker_map)), lidar_height=self.lidar_height_m,
+            barriers=barriers)
+        if barriers is None:
+            self.get_logger().warning("no barrier_segments in the config: lidar uses the GUESSED barrier layout "
+                                      "(run tools/map_barriers.py)")
         self.tf_buffer = None
         if self.lidar_enabled:
             if self.lidar_use_tf and Buffer is not None:

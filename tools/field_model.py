@@ -138,8 +138,31 @@ def lines(z=-0.002, colour=(232, 232, 226)):
     return mb.arrays()
 
 
-def barriers(colour=(196, 38, 32), top_colour=(222, 70, 60)):
-    """Jersey-barrier prisms (barrier.blend profile) at barrier_layout()."""
+def measured_barriers(segments, colour=(196, 38, 32), top_colour=(222, 70, 60), depth=0.40, height=0.40):
+    """Measured barrier faces (config barrier_segments) as simple red blocks behind each face
+    (the face towards the field centre)."""
+    mb = MeshBuilder()
+    for a, b in np.asarray(segments, float).reshape(-1, 2, 2):
+        d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
+        n = np.array([-d[1], d[0]])
+        if np.dot(n, (a + b) / 2) < 0:
+            n = -n                                         # outward, away from the field
+        a2, b2 = a + n * depth, b + n * depth
+        inside = np.array([*((a + b2) / 2), height / 2])
+        bottom = [a, b, b2, a2]
+        P = lambda p, h: [p[0], p[1], h]
+        mb.polygon([P(p, height) for p in bottom], top_colour, outward_from=inside)
+        for k in range(4):
+            p, q = bottom[k], bottom[(k + 1) % 4]
+            mb.polygon([P(p, 0), P(q, 0), P(q, height), P(p, height)], colour, outward_from=inside)
+    return mb.arrays()
+
+
+def barriers(colour=(196, 38, 32), top_colour=(222, 70, 60), segments=None):
+    """Jersey-barrier prisms (barrier.blend profile) at barrier_layout(), or the measured
+    barrier faces when `segments` is given."""
+    if segments is not None:
+        return measured_barriers(segments, colour, top_colour)
     mb = MeshBuilder()
     prof = np.array(BARRIER_PROFILE)
     half = BARRIER_LENGTH / 2
@@ -173,9 +196,9 @@ def marker_boxes(markers, tag_size):
     return out
 
 
-def lidar_map(markers, lidar_height):
+def lidar_map(markers, lidar_height, barriers=None):
     """Line segments the localization matches the lidar scan against: [[(x, y, z), (x, y, z)], ...]."""
-    segs, _ = field_map.map_segments(markers, lidar_height=lidar_height)
+    segs, _ = field_map.map_segments(markers, lidar_height=lidar_height, barriers=barriers)
     return [[[a[0], a[1], lidar_height], [b[0], b[1], lidar_height]] for a, b in segs]
 
 

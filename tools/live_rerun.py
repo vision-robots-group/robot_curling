@@ -145,7 +145,8 @@ def load_config(path):
                 lidar_use_tf=bool(loc.get('lidar_use_tf', True)),
                 lidar_offset=(float(loc.get('lidar_x_offset_m', 0.0)), float(loc.get('lidar_y_offset_m', 0.0)),
                               math.radians(float(loc.get('lidar_yaw_offset_deg', 0.0)))),
-                lidar_height=float(loc.get('lidar_height_m', 0.20)))
+                lidar_height=float(loc.get('lidar_height_m', 0.20)),
+                barriers=fm.field_map.parse_barriers(loc.get('barrier_segments', '')))
 
 
 def pose_from_markers(detections, markers):
@@ -355,11 +356,12 @@ class LiveRerun(Node):
                                              colors=[COLOURS['goal_frame']], fill_mode='solid'), static=True)
         rr.log('field/goals/net', rr.LineStrips3D(net, colors=[COLOURS['goal_net']], radii=0.003), static=True)
 
-        pos, tris, nrm, col = fm.barriers()
+        pos, tris, nrm, col = fm.barriers(segments=self.cfg['barriers'])    # measured if in config.yaml
         rr.log('field/barriers', rr.Mesh3D(vertex_positions=pos, triangle_indices=tris, vertex_normals=nrm,
                                            vertex_colors=col), static=True)
         # what the localization matches the lidar against (barrier faces at lidar height + boxes)
-        rr.log('field/lidar_map', rr.LineStrips3D(fm.lidar_map(self.cfg['markers'], self.cfg['lidar_height']),
+        rr.log('field/lidar_map', rr.LineStrips3D(fm.lidar_map(self.cfg['markers'], self.cfg['lidar_height'],
+                                                               self.cfg['barriers']),
                                                   colors=[COLOURS['lidar_map']], radii=0.006), static=True)
 
         # marker boxes: black cube, white paper + black tag flush on the front face

@@ -119,7 +119,8 @@ def main():
     loc = load_localization_params(args.config)
     markers = field_map.markers_by_id(json.loads(loc.get('marker_map', '{}')))
     height = float(loc.get('lidar_height_m', 0.20))
-    segments, labels = field_map.map_segments(markers, lidar_height=height)
+    segments, labels = field_map.map_segments(markers, lidar_height=height,
+                                              barriers=field_map.parse_barriers(loc.get('barrier_segments', '')))
 
     rclpy.init(args=ros_args)
     node = Collector(args.scans, args.from_pose, loc.get('robot_frame', 'base_link'))

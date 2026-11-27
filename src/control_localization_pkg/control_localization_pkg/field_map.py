@@ -5,6 +5,7 @@ Single source of truth for the barriers and the marker boxes: used by the locali
 
 Frame = localization's field frame: (0, 0) centre spot, x towards the target goal, y left.
 """
+import json
 import math
 
 import numpy as np
@@ -69,18 +70,33 @@ def marker_box_square(tag_xy, normal):
     return np.array([[cx + c * u - s * v, cy + s * u + c * v] for u, v in local])
 
 
-def map_segments(markers=None, lidar_height=0.20, boxes=True):
+def parse_barriers(text):
+    """Measured barrier faces (config `barrier_segments`, JSON [[[x1, y1], [x2, y2]], ...],
+    written by tools/map_barriers.py) -> (K, 2, 2) array, or None if not set."""
+    if not text or not str(text).strip():
+        return None
+    segs = np.asarray(json.loads(text), dtype=float).reshape(-1, 2, 2)
+    return segs if len(segs) else None
+
+
+def map_segments(markers=None, lidar_height=0.20, boxes=True, barriers=None):
     """2-D line segments a horizontal lidar at `lidar_height` sees.
 
     markers: {physical id: (x, y) of the tag} (the boxes); None/empty = barriers only.
-    Returns (segments (N, 2, 2), labels [str] * N). Labels: 'wall_left' (y > 0 long side),
-    'wall_right', 'wall_goal_left' (+x short side, y > 0) ... and 'box_<id>'.
+    barriers: measured barrier faces (K, 2, 2) from parse_barriers(); None = the guessed
+    barrier_layout() (rectangle around the carpet).
+    Returns (segments (N, 2, 2), labels [str] * N). Labels: 'barrier_<k>' (measured) or
+    'wall_left' (y > 0 long side), 'wall_right', 'wall_goal_left' ... (guessed), and 'box_<id>'.
     """
     segs, labels = [], []
     fh = barrier_face_half(lidar_height)
     cx, cy = CARPET_HALF
     half = BARRIER_LENGTH / 2
-    if fh is not None:
+    if barriers is not None:
+        for k, seg in enumerate(np.asarray(barriers, dtype=float).reshape(-1, 2, 2)):
+            segs.append(seg)
+            labels.append(f'barrier_{k}')
+    elif fh is not None:
         for x, y, along_x in barrier_layout():
             if along_x:
                 side = 1 if y > 0 else -1
