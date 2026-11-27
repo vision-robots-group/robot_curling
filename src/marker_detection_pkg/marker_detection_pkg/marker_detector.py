@@ -29,7 +29,6 @@ try:
     import pupil_apriltags
 except ImportError:
     import dt_apriltags as pupil_apriltags
-from cv_bridge import CvBridge, CvBridgeError
 from robot_interfaces.msg import Detection, DetectionArray
 from sensor_msgs.msg import CameraInfo, JointState
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -143,21 +142,42 @@ class MarkerDetector(Node):
         # depth 1: always process the newest frame (no backlog of old frames = no lag)
         # best effort: the compressed topic only arrives with best effort
         image_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.subscription_ = None
         if self.use_compressed:
             self.subscription_ = self.create_subscription(CompressedImage, self.image_topic + '/compressed', self.listener_callback, image_qos)
         else:
-            self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, image_qos)
+            # A raw frame is split into many network packets: with best effort ONE lost packet over
+            # Wi-Fi loses the whole frame (the detector then sees nothing). Use reliable when the
+            # publisher offers it, so lost packets are resent. Its QoS is only known once it is
+            # discovered, so subscribe from a timer.
+            self.raw_qos_timer = self.create_timer(1.0, self.__subscribe_raw)
+            self.__subscribe_raw()
         self.publisher_ = self.create_publisher(DetectionArray, self.detections_topic, 10)
         self.bb_publisher = self.create_publisher(Image, self.bb_image_topic, 1)
         self.get_logger().info(
             f"camera: {self.image_topic}{'/compressed' if self.use_compressed else ''} -> {self.detections_topic}"
             f" ({'TF' if self.use_tf else 'pan-tilt geometry'})")
-        self.bridge = CvBridge()
+        self.bridge = None   # cv_bridge only for unusual raw encodings (its import breaks under NumPy 2)
 
         self.image: np.ndarray = None # b/w image mono8
         self.detections: DetectionArray = None
         self.undistort_maps = None   # cached maps for calibration=false (computed once, not every frame)
         self.april = self.__detector()
+
+    def __subscribe_raw(self):
+        """Subscribe to the raw image with the publisher's reliability (reliable if it offers it)."""
+        if self.subscription_ is not None:
+            return
+        publishers = self.get_publishers_info_by_topic(self.image_topic)
+        if not publishers:
+            self.get_logger().info(f"waiting for a publisher on {self.image_topic}", throttle_duration_sec=5.0)
+            return
+        reliable = all(p.qos_profile.reliability == ReliabilityPolicy.RELIABLE for p in publishers)
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.subscription_ = self.create_subscription(Image, self.image_topic, self.listener_callback, qos)
+        self.raw_qos_timer.cancel()
+        self.get_logger().info(f"raw images on {self.image_topic}: {'reliable' if reliable else 'best effort'}")
 
     def now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -395,8 +415,11 @@ class MarkerDetector(Node):
             else:
                 colour = raw_image_to_bgr(msg)
                 if colour is None:   # unusual encoding: let cv_bridge handle it
+                    if self.bridge is None:
+                        from cv_bridge import CvBridge
+                        self.bridge = CvBridge()
                     colour = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except (CvBridgeError, cv2.error) as e:
+        except Exception as e:
             self.get_logger().error(f"Image decode error: {e}")
             return None, None
         if colour is None:
