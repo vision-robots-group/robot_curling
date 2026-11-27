@@ -62,10 +62,14 @@ localization:
     imu_topic: /imu/data_raw
     calib_time: 3.0         # s; rover must stand still while the gyro bias is estimated
     odom_max_age: 0.5       # s; odom/imu older than this = lost, pose not published
-    pos_gain: 0.3           # [0, 1]; share of a marker position fix applied to the pose
-    heading_gain: 0.2       # [0, 1]; share of a marker heading fix applied to the pose
-    max_jump_m: 0.5         # m; fixes further than this from the pose are held back
-    max_rejects: 5          # consecutive held-back fixes before markers are trusted anyway
+    # EKF (state x, y, heading). distance_sigma_m / bearing_sigma_rad above are the measurement noise R.
+    odom_noise_frac: 0.10     # std of travelled distance as a fraction of it (wheel slip)
+    pos_process_sigma: 0.03   # m/sqrt(s); slow position diffusion
+    gyro_noise_sigma: 0.02    # rad/sqrt(s); heading random walk
+    init_pos_sigma: 0.15      # m; uncertainty right after a triangulation anchor
+    init_heading_sigma: 0.15  # rad
+    gate_chi2: 9.21           # per-marker Mahalanobis^2 gate (chi2 2 dof, 99%)
+    max_rejects: 5            # frames with all markers gated out -> re-anchor by triangulation
 
 
 detection_node:

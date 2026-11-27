@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional, Tuple
 from itertools import combinations
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 
@@ -43,10 +43,16 @@ DEFAULTS = {
     "imu_topic": "/imu/data_raw",
     "calib_time": 3.0,        # s; gyroscope bias estimation
     "odom_max_age": 0.5,      # s; message older than this => lost
-    "pos_gain": 0.3,          # [0, 1]; share of a marker position fix applied to the pose
-    "heading_gain": 0.2,      # [0, 1]; share of a marker heading fix applied to the pose
-    "max_jump_m": 0.5,        # m; marker fixes further than this from the pose are suspicious
-    "max_rejects": 5,         # consecutive suspicious fixes before we trust the markers anyway
+    # EKF process noise (prediction)
+    "odom_noise_frac": 0.10,      # std of travelled distance as a fraction of the distance (wheel slip)
+    "pos_process_sigma": 0.03,    # m/sqrt(s); slow position diffusion (lateral slip, unmodelled motion)
+    "gyro_noise_sigma": 0.02,     # rad/sqrt(s); heading random walk from gyro noise / bias drift
+    # EKF initial uncertainty (set at the anchoring triangulation)
+    "init_pos_sigma": 0.15,       # m
+    "init_heading_sigma": 0.15,   # rad
+    # EKF measurement gating
+    "gate_chi2": 9.21,            # Mahalanobis^2 threshold per marker (chi2, 2 dof, 99%)
+    "max_rejects": 5,             # consecutive frames with every marker gated out -> re-anchor by triangulation
 }
 
 
@@ -62,6 +68,77 @@ TARGETS = {
 
 def wrap_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
+
+
+# ---------------------------------------------------------------------------
+# Extended Kalman filter, state s = [x, y, heading] in the field frame.
+# Pure functions (no ROS) so they can be tested on their own.
+# ---------------------------------------------------------------------------
+
+def ekf_predict_translation(state, P, ds, var_ds, q_pos):
+    """Motion step: drive ds metres along the current heading.
+
+    f(s) = [x + ds cos h, y + ds sin h, h]
+    F = df/ds = [[1, 0, -ds sin h], [0, 1, ds cos h], [0, 0, 1]]
+    Q = var_ds * g g^T (error along the heading) + q_pos * I_xy (slow diffusion)
+    """
+    x, y, h = state
+    c, s = np.cos(h), np.sin(h)
+    new_state = np.array([x + ds * c, y + ds * s, h])
+    F = np.array([[1.0, 0.0, -ds * s],
+                  [0.0, 1.0,  ds * c],
+                  [0.0, 0.0,  1.0]])
+    g = np.array([c, s, 0.0])
+    Q = var_ds * np.outer(g, g) + np.diag([q_pos, q_pos, 0.0])
+    return new_state, F @ P @ F.T + Q
+
+
+def ekf_predict_rotation(state, P, dtheta, var_theta):
+    """Motion step: rotate by dtheta (gyro). F = I, Q only on the heading."""
+    new_state = np.array(state, dtype=float)
+    new_state[2] = wrap_angle(new_state[2] + dtheta)
+    P = P.copy()
+    P[2, 2] += var_theta
+    return new_state, P
+
+
+def range_bearing_model(state, marker):
+    """Predicted [distance, bearing] to a marker and the Jacobian H = dh/ds."""
+    dx, dy = np.asarray(marker, dtype=float) - state[:2]
+    q = dx * dx + dy * dy
+    r = np.sqrt(q)
+    z_hat = np.array([r, wrap_angle(np.arctan2(dy, dx) - state[2])])
+    H = np.array([[-dx / r, -dy / r,  0.0],
+                  [ dy / q, -dx / q, -1.0]])
+    return z_hat, H
+
+
+def ekf_update(state, P, z, marker, R, gate_chi2):
+    """Range-bearing update with one marker.
+
+    Returns (state, P, d2, accepted): d2 is the squared Mahalanobis distance of the
+    innovation; the update is skipped (accepted=False) if d2 > gate_chi2.
+    """
+    if np.hypot(*(np.asarray(marker) - state[:2])) < 1e-3:
+        return state, P, float("inf"), False  # on top of the marker: model undefined
+
+    z_hat, H = range_bearing_model(state, marker)
+    nu = np.asarray(z, dtype=float) - z_hat
+    nu[1] = wrap_angle(nu[1])
+
+    S = H @ P @ H.T + R
+    d2 = float(nu @ np.linalg.solve(S, nu))
+    if d2 > gate_chi2:
+        return state, P, d2, False
+
+    K = P @ H.T @ np.linalg.inv(S)
+    new_state = state + K @ nu
+    new_state[2] = wrap_angle(new_state[2])
+
+    # Joseph form keeps P symmetric positive definite despite rounding
+    I_KH = np.eye(3) - K @ H
+    P = I_KH @ P @ I_KH.T + K @ R @ K.T
+    return new_state, 0.5 * (P + P.T), d2, True
 
 
 # marker normals in field coordinates, keyed by physical marker ID.
@@ -159,7 +236,8 @@ class Localization(Node):
             for key, xy in json.loads(self.marker_map).items()
         }
 
-        self.pose = None          # (x, y, heading); odom frame until anchored, field frame after
+        self.state = None         # EKF mean [x, y, heading]; odom frame until anchored, field frame after
+        self.P = None             # EKF covariance (3x3)
         self.anchored = False     # True after the first marker fix
         self.last_fix = None
         self.rejects = 0
@@ -177,6 +255,7 @@ class Localization(Node):
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(Imu, self.imu_topic, self._imu_callback, 50)
         self.pose_publisher = self.create_publisher(PoseStamped, "/field_pose", 10)
+        self.pose_cov_publisher = self.create_publisher(PoseWithCovarianceStamped, "/field_pose_cov", 10)
         self.timer = self.create_timer(0.05, self._tick)
 
         if not self.markers:
@@ -185,28 +264,72 @@ class Localization(Node):
     def now_seconds(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
+    @property
+    def pose(self):
+        """(x, y, heading) tuple of the EKF mean, or None before odometry starts."""
+        if self.state is None:
+            return None
+        return tuple(float(v) for v in self.state)
+
     @staticmethod
     def marker_key(detection):
-        return f"{detection.family}:{detection.id}"            
-                
+        return f"{detection.family}:{detection.id}"
+
     def _marker_detection_callback(self, msg):
-        if self.pose is None:
+        if self.state is None:
             return # odometry not calibrated yet
 
-        # unknown and repeating markers are discarded
-        known = {
-            self.marker_key(d): d
-            for d in msg.detections
-            if self.marker_key(d) in self.markers
-            and np.isfinite(d.dist)
-            and np.isfinite(d.theta)
-            and d.dist > 0
-        }
-        detections = [known[key] for key in sorted(known)]
+        # unknown markers are discarded; the same physical spot (e.g. both tag
+        # families mapped to one post) is used once, so it is not counted twice
+        known = {}
+        for d in msg.detections:
+            key = self.marker_key(d)
+            if (key in self.markers and np.isfinite(d.dist) and np.isfinite(d.theta) and d.dist > 0):
+                known.setdefault(key, d)
+        detections, spots = [], set()
+        for key in sorted(known):
+            spot = tuple(self.markers[key])
+            if spot not in spots:
+                spots.add(spot)
+                detections.append(known[key])
 
-        if len(detections) < 2:
+        if not detections:
             return
 
+        # (Re-)anchor by triangulation: before the first fix (pose only in the odom
+        # frame), or when the filter has rejected every marker for several frames
+        # (it is probably lost, e.g. the robot was picked up / slipped badly).
+        if not self.anchored or self.rejects >= self.max_rejects:
+            fix = self._triangulate(detections)
+            if fix is not None:
+                if self.anchored:
+                    self.get_logger().warning(
+                        f"EKF rejected markers {self.rejects} frames in a row: re-anchoring by triangulation.")
+                self._anchor(fix)
+                return
+            if not self.anchored:
+                return  # one marker cannot fix a pose without a prior
+
+        # EKF update: one range-bearing measurement per marker, any number of markers
+        R = np.diag([self.distance_sigma_m ** 2, self.bearing_sigma_rad ** 2])
+        accepted = 0
+        for d in detections:
+            self.state, self.P, d2, ok = ekf_update(
+                self.state, self.P, (d.dist, d.theta),
+                self.markers[self.marker_key(d)], R, self.gate_chi2)
+            if ok:
+                accepted += 1
+            else:
+                self.get_logger().debug(f"marker {self.marker_key(d)} gated out (d2={d2:.1f})")
+
+        if accepted:
+            self.last_fix = self.now_seconds()
+            self.rejects = 0
+        else:
+            self.rejects += 1
+
+    def _triangulate(self, detections):
+        """Best triangulated (x, y, heading) over all marker pairs, or None (needs 2+ markers)."""
         best_pose = None
         best_score = float("inf")
 
@@ -224,30 +347,17 @@ class Localization(Node):
                 best_score = score
                 best_pose = candidate
 
-        if best_pose is not None:
-            self._apply_fix(best_pose)
+        return best_pose
 
-    def _apply_fix(self, fix):
-        """Blend a marker fix into the odometry pose (first fix anchors the field frame)."""
+    def _anchor(self, fix):
+        """Initialise the EKF in the field frame from a triangulated pose."""
+        self.state = np.array(fix, dtype=float)
+        self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, self.init_heading_sigma ** 2])
         self.last_fix = self.now_seconds()
-
-        if not self.anchored:
-            self.pose, self.anchored = fix, True
-            self.get_logger().info("Anchored to field frame by first marker fix.")
-            return
-
-        x, y, h = self.pose
-        fx, fy, fh = fix
-        if np.hypot(fx - x, fy - y) > self.max_jump_m and self.rejects < self.max_rejects:
-            self.rejects += 1 # likely outlier or mirror solution
-            return
         self.rejects = 0
-
-        self.pose = (
-            float(x + self.pos_gain * (fx - x)),
-            float(y + self.pos_gain * (fy - y)),
-            float(wrap_angle(h + self.heading_gain * wrap_angle(fh - h))),
-        )
+        if not self.anchored:
+            self.anchored = True
+            self.get_logger().info("Anchored to field frame by first marker fix.")
 
     def __triangulation_2p(self, detections) -> Optional[Tuple[float, float]]:
         first, second = detections
@@ -322,22 +432,27 @@ class Localization(Node):
             self.gyro.append(gz)
             if (now - self.calib_start).nanoseconds * 1e-9 >= self.calib_time:
                 self.bias = sum(self.gyro) / len(self.gyro)
-                self.pose = (0.0, 0.0, 0.0)
+                self.state = np.zeros(3)
+                self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, self.init_heading_sigma ** 2])
                 self.get_logger().info(f"Gyro bias {self.bias:.5f} rad/s, odometry started.")
-        elif self.imu_stamp is not None and self.pose is not None:
+        elif self.imu_stamp is not None and self.state is not None:
+            # EKF predict (rotation part)
             dt = (now - self.imu_stamp).nanoseconds * 1e-9
-            x, y, h = self.pose
-            self.pose = (x, y, float(wrap_angle(h + (gz - self.bias) * dt)))
+            if dt > 0:
+                self.state, self.P = ekf_predict_rotation(
+                    self.state, self.P, (gz - self.bias) * dt, self.gyro_noise_sigma ** 2 * dt)
         self.imu_stamp = now
 
     def _odom_callback(self, msg):
-        """Wheel speed integrated along the current heading."""
+        """EKF predict (translation part): wheel speed integrated along the current heading."""
         now = self.get_clock().now()
-        if self.pose is not None and self.odom_stamp is not None:
+        if self.state is not None and self.odom_stamp is not None:
             dt = (now - self.odom_stamp).nanoseconds * 1e-9
-            ds = msg.twist.twist.linear.x * dt
-            x, y, h = self.pose
-            self.pose = (float(x + ds * np.cos(h)), float(y + ds * np.sin(h)), h)
+            if dt > 0:
+                ds = msg.twist.twist.linear.x * dt
+                self.state, self.P = ekf_predict_translation(
+                    self.state, self.P, ds,
+                    (self.odom_noise_frac * ds) ** 2, self.pos_process_sigma ** 2 * dt)
         self.odom_stamp = now
 
     def _aim_camera(self, now):
@@ -392,9 +507,21 @@ class Localization(Node):
         msg.pose.orientation.w = float(np.cos(heading / 2))
         self.pose_publisher.publish(msg)
 
+        # Same pose with the EKF covariance (6x6 row-major: x, y, z, roll, pitch, yaw)
+        cov_msg = PoseWithCovarianceStamped()
+        cov_msg.header = msg.header
+        cov_msg.pose.pose = msg.pose
+        cov = np.zeros((6, 6))
+        idx = [0, 1, 5]
+        cov[np.ix_(idx, idx)] = self.P
+        cov_msg.pose.covariance = [float(v) for v in cov.flatten()]
+        self.pose_cov_publisher.publish(cov_msg)
+
+        sx, sy, sh = np.sqrt(np.diag(self.P))
         fix_age = f"{self.now_seconds() - self.last_fix:.1f}s ago" if self.last_fix else "never"
         self.get_logger().info(
             f"Field pose: x={x:.2f}, y={y:.2f}, heading={np.degrees(heading):.1f} deg; "
+            f"sigma=({sx:.2f} m, {sy:.2f} m, {np.degrees(sh):.1f} deg); "
             f"frame={msg.header.frame_id}; last marker fix {fix_age}",
             throttle_duration_sec=1.0,
         )
