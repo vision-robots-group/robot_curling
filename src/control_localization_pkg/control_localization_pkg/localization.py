@@ -10,19 +10,7 @@ from itertools import combinations
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, LaserScan
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.time import Time
-
-from control_localization_pkg import field_map
-from control_localization_pkg.scan_matcher import (
-    scan_to_points, match, fit_cost, ekf_update_pose, compose)
-
-try:
-    from tf2_ros import Buffer, TransformException, TransformListener
-except ImportError:      # no tf2: the lidar mount comes from the parameters only
-    Buffer = TransformListener = None
-    TransformException = Exception
+from sensor_msgs.msg import Imu
 
 
 DEFAULTS = {
@@ -70,35 +58,12 @@ DEFAULTS = {
     "odom_noise_frac": 0.10,      # std of travelled distance as a fraction of the distance (wheel slip)
     "pos_process_sigma": 0.03,    # m/sqrt(s); slow position diffusion (lateral slip, unmodelled motion)
     "gyro_noise_sigma": 0.02,     # rad/sqrt(s); heading random walk from gyro noise / bias drift
-    "gyro_scale_noise_frac": 0.05,  # std of a measured rotation as a fraction of it (gyro scale error)
     # EKF initial uncertainty (set at the anchoring triangulation)
     "init_pos_sigma": 0.15,       # m
     "init_heading_sigma": 0.15,   # rad
     # EKF measurement gating
     "gate_chi2": 9.21,            # Mahalanobis^2 threshold per marker (chi2, 2 dof, 99%)
     "max_rejects": 5,             # consecutive frames with every marker gated out -> re-anchor by triangulation
-    # Lidar scan matching against the static map (red barriers + marker boxes, field_map.py)
-    "lidar_enabled": True,
-    "barrier_segments": "",       # measured barrier faces, JSON (tools/map_barriers.py); "" = guessed layout
-    "scan_topic": "/scan",
-    "robot_frame": "base_link",
-    "lidar_rate_hz": 5.0,         # scan matches per second
-    "lidar_use_tf": True,         # mount from TF robot_frame <- scan frame, plus the offsets below
-    "lidar_yaw_offset_deg": 0.0,  # added to the mount yaw (tools/calibrate_lidar.py measures it)
-    "lidar_x_offset_m": 0.0,
-    "lidar_y_offset_m": 0.0,
-    "lidar_height_m": 0.20,       # beam height above the floor (where it hits the sloped barriers)
-    "lidar_min_range": 0.15,
-    "lidar_max_range": 6.0,
-    "lidar_min_inliers": 40,      # points within 10 cm of the map needed to accept a match
-    "lidar_max_rms": 0.08,        # m; max inlier distance rms
-    "lidar_cov_inflate": 8.0,     # scan points are correlated: inflate the ICP covariance
-    "lidar_gate_chi2": 11.34,     # chi2 3 dof 99 %
-    "lidar_max_omega": 0.6,       # rad/s; no matching while turning faster (scan skew)
-    "lidar_triang_weight": 10.0,  # weight of the scan fit when choosing a triangulation candidate
-    "lidar_max_gated": 5,         # good, well-conditioned matches gated out in a row -> EKF reset to the lidar pose
-    "lidar_reanchor": False,      # try to re-find the pose from the scan alone after lidar_max_rejects
-    "lidar_max_rejects": 10,
 }
 
 
@@ -319,31 +284,6 @@ class Localization(Node):
         self.gyro = []
         self.bias = None
 
-        # lidar scan matching
-        self.gyro_rate = 0.0
-        self.scan_points = None     # (time, robot-frame points) of the last scan
-        self.lidar_last = float("-inf")
-        self.lidar_mount = None     # (x, y, yaw) of the lidar in robot_frame
-        self.lidar_tf_wait = None
-        self.lidar_rejects = 0
-        self.lidar_gated = 0
-        barriers = field_map.parse_barriers(self.barrier_segments)
-        self.segments, _ = field_map.map_segments(
-            field_map.markers_by_id(json.loads(self.marker_map)), lidar_height=self.lidar_height_m,
-            barriers=barriers)
-        if barriers is None:
-            self.get_logger().warning("no barrier_segments in the config: lidar uses the GUESSED barrier layout "
-                                      "(run tools/map_barriers.py)")
-        self.tf_buffer = None
-        if self.lidar_enabled:
-            if self.lidar_use_tf and Buffer is not None:
-                self.tf_buffer = Buffer()
-                self.tf_listener = TransformListener(self.tf_buffer, self)
-            self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, qos_profile_sensor_data)
-            self.lidar_fix_publisher = self.create_publisher(PoseWithCovarianceStamped, "/lidar_fix", 10)
-            if len(self.segments) == 0:
-                self.get_logger().warning("lidar_height_m above the barriers and boxes: nothing to match")
-
         self.camera_publisher = self.create_publisher(JointState, self.camera_cmd_topic, 10)
         self.camera_last_update = float("-inf")
         self.camera_last_pan = None
@@ -449,7 +389,7 @@ class Localization(Node):
             if candidate is None:
                 continue
 
-            score = self._score(candidate, detections) + self._scan_score(candidate)
+            score = self._score(candidate, detections)
             if score < best_score:
                 best_score = score
                 best_pose = candidate
@@ -528,131 +468,6 @@ class Localization(Node):
 
         return score
 
-    def _scan_score(self, pose):
-        """Penalty for a candidate pose whose recent lidar scan does not lie on the map."""
-        if self.scan_points is None or self.now_seconds() - self.scan_points[0] > 0.5:
-            return 0.0
-        return self.lidar_triang_weight * (fit_cost(self.scan_points[1], pose, self.segments) / 0.05) ** 2
-
-    # ---- lidar ---------------------------------------------------------------------------
-    def _get_lidar_mount(self, frame_id):
-        """(x, y, yaw) of the lidar in robot_frame: TF (if used) composed with the offset parameters."""
-        if self.lidar_mount is not None:
-            return self.lidar_mount
-        offset = (self.lidar_x_offset_m, self.lidar_y_offset_m, np.deg2rad(self.lidar_yaw_offset_deg))
-        base = (0.0, 0.0, 0.0)
-        if self.tf_buffer is not None:
-            now = self.now_seconds()
-            if self.lidar_tf_wait is None:
-                self.lidar_tf_wait = now
-            try:
-                tr = self.tf_buffer.lookup_transform(self.robot_frame, frame_id, Time())
-                t, q = tr.transform.translation, tr.transform.rotation
-                yaw = np.arctan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-                base = (t.x, t.y, float(yaw))
-            except TransformException:
-                if now - self.lidar_tf_wait < 5.0:
-                    return None
-                self.get_logger().warning(
-                    f"no TF {self.robot_frame} <- {frame_id}: lidar mount from the offset parameters only")
-        # offsets are given in robot_frame (x, y) and added to the yaw
-        self.lidar_mount = (base[0] + offset[0], base[1] + offset[1], float(base[2] + offset[2]))
-        self.get_logger().info(
-            "lidar mount x={:.3f} y={:.3f} yaw={:.1f} deg".format(
-                self.lidar_mount[0], self.lidar_mount[1], np.degrees(self.lidar_mount[2])))
-        return self.lidar_mount
-
-    def _match(self, points, prior):
-        return match(points, prior, self.segments, min_inliers=self.lidar_min_inliers,
-                     max_rms=self.lidar_max_rms, cov_inflate=self.lidar_cov_inflate)
-
-    def _scan_callback(self, msg):
-        """EKF update with the pose the scan gives when aligned to the barriers and boxes."""
-        now = self.now_seconds()
-        if now - self.lidar_last < 1.0 / max(self.lidar_rate_hz, 1e-3):
-            return
-        mount = self._get_lidar_mount(msg.header.frame_id)
-        if mount is None:
-            return
-        self.lidar_last = now
-        points = scan_to_points(msg.ranges, msg.angle_min, msg.angle_increment, mount=mount,
-                                range_min=max(msg.range_min, self.lidar_min_range),
-                                range_max=min(msg.range_max, self.lidar_max_range))
-        self.scan_points = (now, points)
-
-        if not self.anchored or self.state is None or len(self.segments) == 0:
-            return  # pose still in the odom frame: the map cannot be used yet
-        if abs(self.gyro_rate) > self.lidar_max_omega:
-            return
-
-        res = self._match(points, self.state)
-        if res.ok:
-            self._publish_lidar_fix(res)
-            self.state, self.P, d2, accepted = ekf_update_pose(
-                self.state, self.P, res.pose, res.cov, self.lidar_gate_chi2)
-        else:
-            d2, accepted = float("nan"), False
-
-        if accepted:
-            self.last_fix = now
-            self.lidar_rejects = 0
-            self.lidar_gated = 0
-            self.get_logger().debug(
-                f"lidar fix: {res.n_inliers} inliers, rms {res.rms:.3f} m, d2 {d2:.1f}")
-            return
-
-        # The scan fits the map well but the EKF disagrees, several scans in a row: the EKF is
-        # overconfident (e.g. heading drift after a turn). Trust the lidar, as with a marker re-anchor.
-        well_conditioned = res.ok and np.all(np.sqrt(np.diag(res.cov)) < [0.10, 0.10, np.deg2rad(3.0)])
-        self.lidar_gated = self.lidar_gated + 1 if well_conditioned else 0
-        if self.lidar_gated >= self.lidar_max_gated:
-            self.get_logger().warning(
-                f"lidar disagreed with the EKF {self.lidar_gated} scans in a row: EKF reset to the lidar pose "
-                f"({res.pose[0]:.2f}, {res.pose[1]:.2f}, {np.degrees(res.pose[2]):.0f} deg)")
-            self.state = np.array(res.pose, dtype=float)
-            self.P = res.cov + np.diag([0.05 ** 2, 0.05 ** 2, np.deg2rad(3.0) ** 2])
-            self.last_fix = now
-            self.lidar_gated = self.lidar_rejects = 0
-            return
-
-        self.lidar_rejects += 1
-        self.get_logger().info(
-            f"lidar match rejected ({'gated' if res.ok else 'poor fit'}: {res.n_inliers} inliers, "
-            f"rms {res.rms:.3f} m, d2 {d2:.1f})", throttle_duration_sec=2.0)
-        if self.lidar_reanchor and self.lidar_rejects >= self.lidar_max_rejects:
-            self._lidar_reanchor(points)
-
-    def _lidar_reanchor(self, points):
-        """Lost: search around the current pose for a scan alignment that clearly fits."""
-        best = None
-        for dth in (-0.3, 0.0, 0.3):
-            for dx, dy in ((0, 0), (0.4, 0), (-0.4, 0), (0, 0.4), (0, -0.4)):
-                res = self._match(points, compose(self.state, (dx, dy, dth)))
-                if res.ok and (best is None or res.rms < best.rms):
-                    best = res
-        if (best is not None and best.n_inliers >= 2 * self.lidar_min_inliers
-                and best.rms <= 0.5 * self.lidar_max_rms):
-            self.get_logger().warning(
-                f"lidar re-anchor: ({best.pose[0]:.2f}, {best.pose[1]:.2f}, {np.degrees(best.pose[2]):.0f} deg)")
-            self._anchor(best.pose)
-            self.lidar_rejects = 0
-
-    def _publish_lidar_fix(self, res):
-        msg = PoseWithCovarianceStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "map"
-        msg.pose.pose.position.x = float(res.pose[0])
-        msg.pose.pose.position.y = float(res.pose[1])
-        msg.pose.pose.orientation.z = float(np.sin(res.pose[2] / 2))
-        msg.pose.pose.orientation.w = float(np.cos(res.pose[2] / 2))
-        cov = np.zeros((6, 6))
-        idx = [0, 1, 5]
-        cov[np.ix_(idx, idx)] = res.cov
-        cov[2, 2] = float(res.n_inliers)   # (z variance unused) carries the inlier count for the viewer
-        cov[3, 3] = float(res.rms)         # (roll variance unused) carries the rms for the viewer
-        msg.pose.covariance = [float(v) for v in cov.flatten()]
-        self.lidar_fix_publisher.publish(msg)
-
     def _imu_callback(self, msg):
         """Gyro: calibrate the bias while standing still, then integrate the heading."""
         now = self.get_clock().now()
@@ -670,12 +485,9 @@ class Localization(Node):
         elif self.imu_stamp is not None and self.state is not None:
             # EKF predict (rotation part)
             dt = (now - self.imu_stamp).nanoseconds * 1e-9
-            self.gyro_rate = gz - self.bias
             if dt > 0:
-                dtheta = (gz - self.bias) * dt
                 self.state, self.P = ekf_predict_rotation(
-                    self.state, self.P, dtheta,
-                    self.gyro_noise_sigma ** 2 * dt + (self.gyro_scale_noise_frac * dtheta) ** 2)
+                    self.state, self.P, (gz - self.bias) * dt, self.gyro_noise_sigma ** 2 * dt)
         self.imu_stamp = now
 
     def _odom_callback(self, msg):

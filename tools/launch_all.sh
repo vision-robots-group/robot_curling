@@ -22,6 +22,7 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="$REPO/config.yaml"
 UGV_WS="${UGV_WS:-$HOME/ugv_ws}"
+[ -d "$UGV_WS" ] || UGV_WS=/home/ws/ugv_ws    # rover-18 keeps the UGV workspace here
 CALIB_WAIT="${CALIB_WAIT:-6}"      # s to wait for the gyro calibration before the agent starts
 
 RUN_HW=1
@@ -91,7 +92,12 @@ fi
 
 start markers      ros2 launch marker_detection_pkg two_cameras.launch.py config:="$CONFIG"
 start localization ros2 run control_localization_pkg localization --ros-args --params-file "$CONFIG"
-start lidar_hist   ros2 run object_detection_pkg detector --ros-args --params-file "$CONFIG"
+# The UGV workspace has its own object_detection_pkg (no `detector`) that shadows ours both in
+# `ros2 run` and on the Python path, whatever order the workspaces are sourced in: start ours by
+# full path with its site-packages first.
+OD_SITE="$(echo "$REPO"/install/object_detection_pkg/lib/python3*/site-packages)"
+start lidar_hist   env PYTHONPATH="$OD_SITE:${PYTHONPATH:-}" \
+    "$REPO/install/object_detection_pkg/lib/object_detection_pkg/detector" --ros-args --params-file "$CONFIG"
 
 if [ "$RUN_AGENT" = 1 ]; then
     echo "[launch_all] keep the rover still, waiting ${CALIB_WAIT}s for the gyro calibration"
