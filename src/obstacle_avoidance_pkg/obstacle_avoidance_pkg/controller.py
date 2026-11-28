@@ -12,6 +12,8 @@ class Agent(Node):
     Reads the lidar histogram and ``/field_pose``, publishes ``/cmd_vel``. State machine:
     CRUISE (steer at the goal, DONE at ``stop_dist``) -> TURN_AWAY -> SIDESTEP -> PASS -> CRUISE.
     CORNER spins in place when both sides are blocked. Before the first marker fix we drive straight.
+    ALIGN turns in place when the goal heading error is large (CRUISE <-> ALIGN, with hysteresis).
+    BLOCKED stands still when the front is blocked by an obstacle sitting on the goal area.
     """
     def __init__(self, hist_sub: ObjectDetectionSubscriber):
         super().__init__('agent')
@@ -32,6 +34,7 @@ class Agent(Node):
         self.sigma = 1
         self.clear_count = 0
         self.s_pass = 0.0
+        self.goal_occupied = False
 
         self.callback_dict = {
             State.CORNER: self.__corner,
@@ -39,6 +42,8 @@ class Agent(Node):
             State.TURN_AWAY: self.__turn_away,
             State.SIDESTEP: self.__clear_front,
             State.PASS: self.__drive_by_obstacle,
+            State.ALIGN: self.__align,
+            State.BLOCKED: self.__blocked,
             State.DONE: self.__done,
         }
 
@@ -91,15 +96,21 @@ class Agent(Node):
             self.dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
             self.bearing = math.atan2(self.goal[1] - y, self.goal[0] - x)
             self.hist = self.__drop_goal(hist, x, y, th)
+            self.goal_occupied = self.__goal_occupied(self.hist, x, y, th)
             if self.dist <= self.stop_dist: self.state = State.DONE
         else:
             self.dist, self.bearing, self.hist = math.inf, self.start_heading, hist
+            self.goal_occupied = False
 
         front_blocked = any(self.__in_front(d, a) for d, a in self.hist if abs(a) <= self.fov)
         prev = self.state
 
-        if front_blocked and self.state not in (State.CORNER, State.TURN_AWAY, State.DONE):
-            if self.state == State.CRUISE:
+        if front_blocked and self.state not in (State.CORNER, State.TURN_AWAY, State.DONE,
+                                                State.ALIGN, State.BLOCKED):
+            if self.goal_occupied:
+                # going around makes no sense: the obstacle sits on the goal -> stop and wait
+                self.state, self.clear_count = State.BLOCKED, 0
+            elif self.state == State.CRUISE:
                 self.origin, self.angle = (x, y), self.bearing
                 self.sigma = self.__pick_side(0.0)
                 self.state = State.TURN_AWAY
@@ -120,6 +131,14 @@ class Agent(Node):
                 if math.hypot(px - self.goal[0], py - self.goal[1]) < self.goal_ignore_radius: continue
             keep.append((d, a))
         return keep
+
+    def __goal_occupied(self, hist, x, y, th):
+        """True if an obstacle point (duck already dropped) lies within goal_occupied_radius of the goal."""
+        for d, a in hist:
+            if math.isfinite(d):
+                px, py = x + d * math.cos(th + a), y + d * math.sin(th + a)
+                if math.hypot(px - self.goal[0], py - self.goal[1]) < self.goal_occupied_radius: return True
+        return False
 
     def __errors(self, x, y):
         dx, dy = x - self.origin[0], y - self.origin[1]
@@ -162,9 +181,28 @@ class Agent(Node):
         return v_min + k * (self.v_max - v_min)
 
     def __cruise(self, th, s, e, front_blocked):
+        err = wrap(self.bearing - th)
+        if self.anchored and abs(err) > self.align_enter:
+            self.state = State.ALIGN
+            return 0.0, 0.0
         v = self.__speed(self.v_slow)
-        if self.dist < self.goal_slow_dist: v = min(v, self.v_slow)
-        return v, self.k_theta * wrap(self.bearing - th)
+        if self.dist < self.goal_slow_dist or self.goal_occupied: v = min(v, self.v_slow)
+        v *= max(0.0, math.cos(err))      # slow down while the heading error is still large
+        return v, self.k_theta * err
+
+    def __align(self, th, s, e, front_blocked):
+        err = wrap(self.bearing - th)
+        if abs(err) < self.align_exit:
+            self.state = State.CRUISE
+            return 0.0, 0.0
+        w = self.k_theta * err
+        return 0.0, math.copysign(max(abs(w), self.omega_min), w)   # v = 0: turn in place
+
+    def __blocked(self, th, s, e, front_blocked):
+        self.get_logger().warning('Goal occupied by an obstacle: waiting', throttle_duration_sec=2.0)
+        self.clear_count = 0 if (front_blocked and self.goal_occupied) else self.clear_count + 1
+        if self.clear_count >= self.clear_ticks: self.state = State.CRUISE
+        return 0.0, 0.0
 
     def __turn_away(self, th, s, e, front_blocked):
         if not self.__side_clear(1) and not self.__side_clear(-1):

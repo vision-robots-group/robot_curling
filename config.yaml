@@ -113,4 +113,8 @@ agent:
     stop_dist: 0.15           # m; stop this far from the duck
     goal_slow_dist: 0.8       # m; drive at v_slow closer than this
     goal_ignore_radius: 0.35  # m; lidar points this close to the goal are the duck, not an obstacle
+    goal_occupied_radius: 0.6 # m; other obstacle points this close to the goal = goal occupied -> stop, no avoidance
+    align_enter_deg: 35.0     # heading error above this -> stop and turn in place (ALIGN)
+    align_exit_deg: 8.0       # back to driving below this
+    omega_min: 0.25           # rad/s; slowest turn-in-place that still rotates the rover
     pose_max_age: 0.5         # s; stop the rover if /field_pose is older

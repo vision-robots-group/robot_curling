@@ -7,6 +7,8 @@ class State(Enum):
     SIDESTEP = auto()
     PASS = auto()
     CORNER = auto()
+    ALIGN = auto()      # turn in place towards the goal
+    BLOCKED = auto()    # goal area occupied and front blocked: stand still until it clears
     DONE = auto()
 
 def wrap(a):
@@ -50,4 +52,10 @@ DEFAULTS = {
     'k_theta': 1.5,
     'k_e': 1.0,
     'rate': 10.0,
+    # turn in place (ALIGN)
+    'align_enter_deg': 35.0,       # heading error above this -> stop and turn in place
+    'align_exit_deg': 8.0,         # back to CRUISE below this (hysteresis)
+    'omega_min': 0.25,             # rad/s; slowest turn-in-place command that still rotates the rover
+    # occupied goal (BLOCKED)
+    'goal_occupied_radius': 0.6,   # m; obstacle points this close to the goal (but not the duck) = goal occupied
 }
