@@ -49,17 +49,30 @@ else
     echo "no $REPO/install: run 'colcon build --symlink-install' in $REPO first" >&2
     exit 1
 fi
+# /home/ws/ugv_ws ships its own (older) object_detection_pkg, and ~/.bashrc sources that
+# workspace, so it can shadow ours in AMENT_PREFIX_PATH / PYTHONPATH ("No executable found").
+# Put every package of this repo in front of both paths.
+for p in "$REPO"/install/*/; do
+    p="${p%/}"
+    [ -d "$p/share/ament_index" ] || continue
+    export AMENT_PREFIX_PATH="$p:$AMENT_PREFIX_PATH"
+    for sp in "$p"/lib/python3*/site-packages; do
+        [ -d "$sp" ] && export PYTHONPATH="$sp:${PYTHONPATH:-}"
+    done
+done
 set -u
 
 LOGDIR="$REPO/logs/launch_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOGDIR"
 PIDS=()
+NAMES=()
 
 start() { # start <name> <command...>: run in the background with its own log
     local name="$1"; shift
     echo "[launch_all] starting $name"
     setsid "$@" >"$LOGDIR/$name.log" 2>&1 &
     PIDS+=($!)
+    NAMES+=("$name")
 }
 
 stop_all() {
@@ -107,9 +120,11 @@ echo "[launch_all] running. Tail a log: tail -f $LOGDIR/localization.log   (Ctrl
 
 # stop everything if any node dies
 while true; do
-    for pid in "${PIDS[@]}"; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            echo "[launch_all] a process exited (pid $pid), check $LOGDIR"
+    for i in "${!PIDS[@]}"; do
+        if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
+            name="${NAMES[$i]}"
+            echo "[launch_all] '$name' exited (pid ${PIDS[$i]}), last lines of $LOGDIR/$name.log:"
+            tail -n 15 "$LOGDIR/$name.log" | sed 's/^/    /'
             exit 1
         fi
     done
