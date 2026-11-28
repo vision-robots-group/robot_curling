@@ -119,6 +119,17 @@ class Agent(Node):
 
         s, e = self.__errors(x, y) if self.origin is not None else (0.0, 0.0)
         v, w = self.callback_dict[self.state](th, s, e, front_blocked)
+
+        # Hard stop on the RAW lidar (goal points not dropped: a duck or an obstacle on the goal
+        # counts too). Turning in place stays allowed; no forward motion into anything.
+        if v > 0 and any(self.__in_front(d, a, self.estop_dist) for d, a in hist if math.isfinite(d)):
+            if self.anchored and self.dist < self.goal_slow_dist:
+                self.state, v, w = State.DONE, 0.0, 0.0   # something at the goal: this is as close as we go
+                self.get_logger().warning('Object right in front near the goal: stopping (DONE)')
+            else:
+                v = 0.0
+                self.get_logger().warning('Emergency stop: object right in front', throttle_duration_sec=1.0)
+
         if self.state != prev:
             self.get_logger().info(f'{prev.name} -> {self.state.name}')
         self.publish_cmd(v, max(-self.omega_max, min(self.omega_max, w)))
@@ -156,8 +167,9 @@ class Agent(Node):
     def __side_clear(self, side):
         return all(not d < self.safe_distance for d, _ in self.__sector(side))
 
-    def __in_front(self, d, a):
-        return d * math.cos(a) < self.safe_distance and abs(d * math.sin(a)) < self.half_width
+    def __in_front(self, d, a, reach=None):
+        reach = self.safe_distance if reach is None else reach
+        return 0 < d * math.cos(a) < reach and abs(d * math.sin(a)) < self.half_width
 
     def __pick_side(self, e):
         bins = sorted(self.hist, key=lambda b: b[1])

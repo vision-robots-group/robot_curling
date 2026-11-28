@@ -58,4 +58,5 @@ DEFAULTS = {
     'omega_min': 0.25,             # rad/s; slowest turn-in-place command that still rotates the rover
     # occupied goal (BLOCKED)
     'goal_occupied_radius': 0.6,   # m; obstacle points this close to the goal (but not the duck) = goal occupied
+    'estop_dist': 0.35,            # m from the lidar; anything (duck included) closer in front -> no forward motion
 }

@@ -80,7 +80,7 @@ localization:
     lidar_angle_offset_deg: 90.0  # robot bearing = scan angle + this (same convention as object_detection_pkg)
     lidar_window_deg: 1.5     # half-width of the scan sector read around the marker bearing
     lidar_gate_frac: 0.25     # lidar used only if within 25% of the camera distance
-    lidar_sigma_m: 0.05       # m; distance std when the lidar range is used (camera: distance_sigma_m)
+    lidar_sigma_m: 0.10       # m; distance std when the lidar range is used (camera: distance_sigma_m); 0.05 caused re-anchors
     lidar_box_offset_m: 0.0   # m; added to lidar range (> 0 if marker_map holds box centres, not faces)
     lidar_max_age: 0.3        # s
 
@@ -126,4 +126,5 @@ agent:
     align_enter_deg: 35.0     # heading error above this -> stop and turn in place (ALIGN)
     align_exit_deg: 8.0       # back to driving below this
     omega_min: 0.25           # rad/s; slowest turn-in-place that still rotates the rover
+    estop_dist: 0.35          # m from the lidar (rover centre); anything closer in front, duck included -> stop
     pose_max_age: 0.5         # s; stop the rover if /field_pose is older
