@@ -9,7 +9,7 @@ from itertools import combinations
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 
 
 DEFAULTS = {
@@ -56,6 +56,15 @@ DEFAULTS = {
     # Single-marker fix (anchor / re-anchor with one marker, using the gyro heading)
     "initial_heading_deg": 0.0,   # rover heading in the field frame at start (0 = facing +x)
     "single_marker_fix": True,    # false: anchoring needs 2+ markers (old behaviour)
+    # Lidar fusion: the camera gives id + bearing, the lidar gives the (much better) range to the marker box
+    "lidar_fusion": True,
+    "scan_topic": "/scan",
+    "lidar_angle_offset_deg": 90.0,  # robot bearing = scan angle + this (same as object_detection_pkg)
+    "lidar_window_deg": 1.5,      # half-width of the scan sector read around the marker bearing
+    "lidar_gate_frac": 0.25,      # use lidar only if |lidar - camera| <= this fraction of the camera distance
+    "lidar_sigma_m": 0.05,        # distance std when the lidar range is used
+    "lidar_box_offset_m": 0.0,    # added to the lidar range (lidar hits the box face; >0 if the map holds box centres)
+    "lidar_max_age": 0.3,         # s; older scans are not used
 }
 
 
@@ -257,6 +266,12 @@ class Localization(Node):
         self.create_subscription(DetectionArray, "/detected_markers", self._marker_detection_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(Imu, self.imu_topic, self._imu_callback, 50)
+        self.scan = None
+        self.scan_time = None
+        self.lidar_used = 0          # marker distances taken from the lidar / total (for the log)
+        self.lidar_total = 0
+        if self.lidar_fusion:
+            self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, 10)
         self.pose_publisher = self.create_publisher(PoseStamped, "/field_pose", 10)
         self.pose_cov_publisher = self.create_publisher(PoseWithCovarianceStamped, "/field_pose_cov", 10)
         self.timer = self.create_timer(0.05, self._tick)
@@ -299,6 +314,18 @@ class Localization(Node):
         if not detections:
             return
 
+        # Lidar fusion: replace the camera distance with the lidar range at the marker bearing
+        sigmas = {}
+        for d in detections:
+            r = self._lidar_range(d.theta, d.dist) if self.lidar_fusion else None
+            self.lidar_total += 1
+            if r is not None:
+                d.dist = r + self.lidar_box_offset_m
+                sigmas[self.marker_key(d)] = self.lidar_sigma_m
+                self.lidar_used += 1
+            else:
+                sigmas[self.marker_key(d)] = self.distance_sigma_m
+
         # (Re-)anchor by triangulation: before the first fix (pose only in the odom
         # frame), or when the filter has rejected every marker for several frames
         # (it is probably lost, e.g. the robot was picked up / slipped badly).
@@ -320,9 +347,9 @@ class Localization(Node):
                 return  # one marker cannot fix a pose without a prior
 
         # EKF update: one range-bearing measurement per marker, any number of markers
-        R = np.diag([self.distance_sigma_m ** 2, self.bearing_sigma_rad ** 2])
         accepted = 0
         for d in detections:
+            R = np.diag([sigmas[self.marker_key(d)] ** 2, self.bearing_sigma_rad ** 2])
             self.state, self.P, d2, ok = ekf_update(
                 self.state, self.P, (d.dist, d.theta),
                 self.markers[self.marker_key(d)], R, self.gate_chi2)
@@ -336,6 +363,31 @@ class Localization(Node):
             self.rejects = 0
         else:
             self.rejects += 1
+
+    def _scan_callback(self, msg):
+        self.scan = msg
+        self.scan_time = self.now_seconds()
+
+    def _lidar_range(self, bearing, camera_dist):
+        """Median lidar range in a small sector around `bearing` (robot frame, left +),
+        or None if no fresh scan or no reading agrees with the camera distance."""
+        s = self.scan
+        if s is None or self.now_seconds() - self.scan_time > self.lidar_max_age or s.angle_increment <= 0:
+            return None
+        ranges = np.asarray(s.ranges, dtype=float)
+        n = len(ranges)
+        if n == 0:
+            return None
+        # scan index of the marker bearing (scans are 360 deg: indices wrap around)
+        raw = bearing - np.radians(self.lidar_angle_offset_deg)
+        centre = int(round(((raw - s.angle_min) % (2 * np.pi)) / s.angle_increment))
+        half = max(1, int(np.radians(self.lidar_window_deg) / s.angle_increment))
+        sector = ranges[[(centre + k) % n for k in range(-half, half + 1)]]
+        ok = (np.isfinite(sector) & (sector >= s.range_min) & (sector <= s.range_max)
+              & (np.abs(sector - camera_dist) <= self.lidar_gate_frac * camera_dist))
+        if np.count_nonzero(ok) < 2:
+            return None
+        return float(np.median(sector[ok]))
 
     def _triangulate(self, detections):
         """Best triangulated (x, y, heading) over all marker pairs, or None (needs 2+ markers)."""
@@ -544,7 +596,8 @@ class Localization(Node):
         self.get_logger().info(
             f"Field pose: x={x:.2f}, y={y:.2f}, heading={np.degrees(heading):.1f} deg; "
             f"sigma=({sx:.2f} m, {sy:.2f} m, {np.degrees(sh):.1f} deg); "
-            f"frame={msg.header.frame_id}; last marker fix {fix_age}",
+            f"frame={msg.header.frame_id}; last marker fix {fix_age}; "
+            f"lidar ranges used {self.lidar_used}/{self.lidar_total}",
             throttle_duration_sec=1.0,
         )
 

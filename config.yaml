@@ -74,6 +74,15 @@ localization:
     max_rejects: 5            # frames with all markers gated out -> re-anchor by triangulation
     initial_heading_deg: 0.0  # rover heading on the field at start (0 = facing +x); used by the single-marker fix
     single_marker_fix: true   # anchor / re-anchor with one marker + gyro heading; false = needs 2+ markers
+    # Lidar fusion: camera = marker id + bearing, lidar = range to the marker box at that bearing
+    lidar_fusion: true
+    scan_topic: /scan
+    lidar_angle_offset_deg: 90.0  # robot bearing = scan angle + this (same convention as object_detection_pkg)
+    lidar_window_deg: 1.5     # half-width of the scan sector read around the marker bearing
+    lidar_gate_frac: 0.25     # lidar used only if within 25% of the camera distance
+    lidar_sigma_m: 0.05       # m; distance std when the lidar range is used (camera: distance_sigma_m)
+    lidar_box_offset_m: 0.0   # m; added to lidar range (> 0 if marker_map holds box centres, not faces)
+    lidar_max_age: 0.3        # s
 
 
 detection_node:
