@@ -51,6 +51,7 @@ DEFAULTS = {
     # Camera -> robot conversion
     "use_tf": True,             # true: TF (any camera); false: hand-written pan-tilt geometry
     "robot_frame": "base_link",
+    "angle_offset_deg": -7.0,   # added to every detected bearing (pan-tilt calibration; 0 for the OAK)
 }
 
 PAN_TILT_FRAME = "pt_camera_link"   # frame_id of the pan-tilt camera images
@@ -192,7 +193,8 @@ class MarkerDetector(Node):
     def calculate_marker_angle(self, position_robot):
         """Bearing in radians: positive left, negative right."""
         x, y, _ = position_robot
-        return float(np.arctan2(y, x))
+        angle = np.arctan2(y, x) + np.radians(self.angle_offset_deg)
+        return float(np.arctan2(np.sin(angle), np.cos(angle)))   # wrap to [-pi, pi]
        
     def detect(self, gray_image: np.ndarray, header=None) -> DetectionArray:
         """

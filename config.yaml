@@ -7,6 +7,7 @@ marker_detector:
     bb_colour: true        # true: boxes on the colour image; false: grey
     use_compressed: true   # true: read <image topic>/compressed (much faster over Wi-Fi)
     use_tf: true           # true: camera -> base_link from TF; false: hand-written pan-tilt geometry
+    angle_offset_deg: -7.0 # added to every detected marker bearing (pan-tilt angle correction)
 
 # Only used by launch/two_cameras.launch.py (both cameras + fusion)
 marker_detector_oak:
@@ -22,6 +23,7 @@ marker_detector_oak:
     bb_colour: true
     use_compressed: true
     use_tf: true           # required for the OAK (the pan-tilt geometry does not apply)
+    angle_offset_deg: 0.0  # the -7 deg correction is only for the pan-tilt camera
 
 marker_fusion:
   ros__parameters:
@@ -70,6 +72,8 @@ localization:
     init_heading_sigma: 0.15  # rad
     gate_chi2: 9.21           # per-marker Mahalanobis^2 gate (chi2 2 dof, 99%)
     max_rejects: 5            # frames with all markers gated out -> re-anchor by triangulation
+    initial_heading_deg: 0.0  # rover heading on the field at start (0 = facing +x); used by the single-marker fix
+    single_marker_fix: true   # anchor / re-anchor with one marker + gyro heading; false = needs 2+ markers
 
 
 detection_node:

@@ -53,6 +53,9 @@ DEFAULTS = {
     # EKF measurement gating
     "gate_chi2": 9.21,            # Mahalanobis^2 threshold per marker (chi2, 2 dof, 99%)
     "max_rejects": 5,             # consecutive frames with every marker gated out -> re-anchor by triangulation
+    # Single-marker fix (anchor / re-anchor with one marker, using the gyro heading)
+    "initial_heading_deg": 0.0,   # rover heading in the field frame at start (0 = facing +x)
+    "single_marker_fix": True,    # false: anchoring needs 2+ markers (old behaviour)
 }
 
 
@@ -301,11 +304,17 @@ class Localization(Node):
         # (it is probably lost, e.g. the robot was picked up / slipped badly).
         if not self.anchored or self.rejects >= self.max_rejects:
             fix = self._triangulate(detections)
+            keep_heading = False
+            if fix is None and self.single_marker_fix:
+                # one marker: position from the current (gyro) heading; nearest marker is most accurate
+                fix = self._single_marker_fix(min(detections, key=lambda d: d.dist))
+                keep_heading = True
             if fix is not None:
                 if self.anchored:
                     self.get_logger().warning(
-                        f"EKF rejected markers {self.rejects} frames in a row: re-anchoring by triangulation.")
-                self._anchor(fix)
+                        f"EKF rejected markers {self.rejects} frames in a row: re-anchoring"
+                        f" ({'single marker' if keep_heading else 'triangulation'}).")
+                self._anchor(fix, keep_heading=keep_heading)
                 return
             if not self.anchored:
                 return  # one marker cannot fix a pose without a prior
@@ -349,10 +358,23 @@ class Localization(Node):
 
         return best_pose
 
-    def _anchor(self, fix):
-        """Initialise the EKF in the field frame from a triangulated pose."""
+    def _single_marker_fix(self, detection):
+        """(x, y, heading) from one marker; heading is not measured, the current EKF heading is used."""
+        heading = float(self.state[2])
+        marker = self.markers[self.marker_key(detection)]
+        angle = heading + detection.theta
+        x = marker[0] - detection.dist * np.cos(angle)
+        y = marker[1] - detection.dist * np.sin(angle)
+        return (float(x), float(y), heading)
+
+    def _anchor(self, fix, keep_heading=False):
+        """Initialise the EKF in the field frame from a triangulated (or single-marker) pose.
+
+        keep_heading: heading was not measured (single marker), so keep its current variance.
+        """
+        heading_var = self.P[2, 2] if keep_heading else self.init_heading_sigma ** 2
         self.state = np.array(fix, dtype=float)
-        self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, self.init_heading_sigma ** 2])
+        self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, heading_var])
         self.last_fix = self.now_seconds()
         self.rejects = 0
         if not self.anchored:
@@ -432,7 +454,7 @@ class Localization(Node):
             self.gyro.append(gz)
             if (now - self.calib_start).nanoseconds * 1e-9 >= self.calib_time:
                 self.bias = sum(self.gyro) / len(self.gyro)
-                self.state = np.zeros(3)
+                self.state = np.array([0.0, 0.0, wrap_angle(np.radians(self.initial_heading_deg))])
                 self.P = np.diag([self.init_pos_sigma ** 2, self.init_pos_sigma ** 2, self.init_heading_sigma ** 2])
                 self.get_logger().info(f"Gyro bias {self.bias:.5f} rad/s, odometry started.")
         elif self.imu_stamp is not None and self.state is not None:
